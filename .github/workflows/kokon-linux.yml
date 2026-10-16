@@ -1,0 +1,154 @@
+# Kokon: Linux engine builds of the exact stable-diffusion.cpp commit Kokon ships.
+#
+# Upstream's Linux zips are built on Ubuntu 24.04 (glibc 2.38, so no Ubuntu 22.04 / Debian 12)
+# and have no CUDA variant. These are built on Ubuntu 22.04 with upstream's own flags and CUDA
+# architectures, smoke-tested on several distributions, then published as a prerelease.
+name: Kokon Linux engine
+
+on:
+  push:
+    branches: [kokon-linux]
+  workflow_dispatch:
+
+env:
+  # The upstream commit this branch is based on (Kokon's engine.json tag master-964-1d0a58a).
+  ENGINE_SHORT: 1d0a58a
+  VULKAN_VERSION: 1.4.328.1
+  CUDA_VERSION: "12-8"
+  COMMON_DEFINES: -DSD_BUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [vulkan, cuda12]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Vulkan SDK
+        if: matrix.build == 'vulkan'
+        run: |
+          curl -sSL -o "$RUNNER_TEMP/vk.tar.xz" "https://sdk.lunarg.com/sdk/download/${VULKAN_VERSION}/linux/vulkansdk-linux-x86_64-${VULKAN_VERSION}.tar.xz"
+          mkdir -p "$RUNNER_TEMP/vulkan" && tar -xJf "$RUNNER_TEMP/vk.tar.xz" -C "$RUNNER_TEMP/vulkan"
+          SDK="$RUNNER_TEMP/vulkan/${VULKAN_VERSION}/x86_64"
+          echo "VULKAN_SDK=$SDK" >> "$GITHUB_ENV"
+          echo "$SDK/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$SDK/lib" >> "$GITHUB_ENV"
+
+      - name: CUDA toolkit
+        if: matrix.build == 'cuda12'
+        run: |
+          curl -sSL -o "$RUNNER_TEMP/keyring.deb" https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i "$RUNNER_TEMP/keyring.deb"
+          sudo apt-get update
+          sudo apt-get install -y cuda-nvcc-${CUDA_VERSION} cuda-cudart-dev-${CUDA_VERSION} libcublas-dev-${CUDA_VERSION} cuda-cccl-${CUDA_VERSION}
+          CUDA=/usr/local/cuda-${CUDA_VERSION/-/.}
+          echo "CUDA_HOME=$CUDA" >> "$GITHUB_ENV"
+          echo "$CUDA/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.build }}" = vulkan ]; then
+            DEFINES="-DSD_VULKAN=ON"
+          else
+            DEFINES="-DSD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=61;70;75;80;86;89;90;100;120"
+          fi
+          cmake -B build -DCMAKE_BUILD_TYPE=Release $DEFINES $COMMON_DEFINES
+          cmake --build build --config Release -j "$(nproc)"
+
+      - name: Names
+        id: names
+        run: |
+          echo "zip=sd-master-$ENGINE_SHORT-bin-Linux-Ubuntu-22.04-x86_64-${{ matrix.build }}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Pack
+        run: |
+          cp ggml/LICENSE build/bin/ggml.txt
+          cp LICENSE build/bin/stable-diffusion.cpp.txt
+          (cd build/bin && zip -9 "$GITHUB_WORKSPACE/${{ steps.names.outputs.zip }}" *)
+          if [ "${{ matrix.build }}" = cuda12 ]; then
+            mkdir cudart
+            for l in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do cp -L "$CUDA_HOME/lib64/$l" cudart/; done
+            cp "$CUDA_HOME/EULA.txt" cudart/CUDA-EULA.txt 2>/dev/null || true
+            (cd cudart && zip -9 "$GITHUB_WORKSPACE/cudart-sd-bin-linux-cu12-x64.zip" *)
+          fi
+          ls -la *.zip
+
+      - name: Report glibc requirements
+        run: |
+          for f in build/bin/sd-server build/bin/*.so; do
+            printf '%s ' "$f"; objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-${{ matrix.build }}
+          path: "*.zip"
+
+  # The engine must at least load (all shared libraries resolve) on each target distribution.
+  smoke:
+    needs: build
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:22.04", "ubuntu:24.04", "debian:12", "fedora:40", "fedora:42"]
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Tools
+        run: |
+          if command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq unzip libgomp1 libvulkan1 >/dev/null
+          else dnf install -y -q unzip libgomp vulkan-loader /usr/bin/ldd; fi
+      - name: Vulkan engine loads
+        run: |
+          mkdir v && cd v && unzip -q ../*-vulkan.zip
+          ./sd-server --help > help.txt 2>&1 || true
+          head -5 help.txt && grep -qi usage help.txt
+          ! ldd sd-server libggml-vulkan.so | grep 'not found'
+      - name: CUDA engine loads (runtime unpacked next to it)
+        run: |
+          mkdir c && cd c && unzip -q ../*-cuda12.zip && unzip -q -o ../cudart-sd-bin-linux-cu12-x64.zip
+          ./sd-server --help > help.txt 2>&1 || true
+          head -5 help.txt && grep -qi usage help.txt
+          # No GPU driver in CI, so only libcuda.so.1 (from the driver) may be missing.
+          ! ldd sd-server libggml-cuda.so | grep 'not found' | grep -v 'libcuda.so.1'
+
+  release:
+    needs: smoke
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHORT=$ENGINE_SHORT
+          TAG="kokon-linux-$SHORT"
+          sha256sum *.zip | tee SHA256SUMS.txt
+          export GH_REPO="$GITHUB_REPOSITORY"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --prerelease --target "$GITHUB_SHA" \
+            --title "Kokon Linux engine ($SHORT)" \
+            --notes "stable-diffusion.cpp $SHORT (upstream master-964-$SHORT) built on Ubuntu 22.04 for Kokon: Vulkan, CUDA 12.8 (+ runtime). Same flags and CUDA architectures as upstream's Windows builds."
+          gh release upload "$TAG" *.zip SHA256SUMS.txt --clobber
