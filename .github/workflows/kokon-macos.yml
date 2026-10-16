@@ -1,0 +1,115 @@
+# Kokon: macOS engine build of the exact stable-diffusion.cpp commit Kokon ships, for macOS 15+.
+#
+# Upstream's Mac zip is built with the macOS 26 SDK and no deployment target, so its binaries declare
+# macOS 26 as their minimum. ggml-metal already guards its macOS 15 APIs (residency sets) with
+# @available and compiles its shaders at runtime, so the only change is CMAKE_OSX_DEPLOYMENT_TARGET.
+# Same flags as upstream's macOS job otherwise; tested on a macOS 15 runner, then published.
+name: Kokon macOS engine
+
+on:
+  push:
+    branches: [kokon-linux]
+    paths-ignore: [".github/workflows/kokon-linux.yml"]
+  workflow_dispatch:
+
+env:
+  # The upstream commit this branch is based on (Kokon's engine.json tag master-964-1d0a58a).
+  ENGINE_SHORT: 1d0a58a
+  MIN_MACOS: "15.0"
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_AVX2=ON -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DSD_BUILD_SHARED_LIBS=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=$MIN_MACOS
+          cmake --build build --config Release -j "$(sysctl -n hw.ncpu)"
+
+      - name: Check minimum macOS
+        run: |
+          cd build/bin
+          for f in sd-server *.dylib; do
+            for arch in arm64 x86_64; do
+              v=$(vtool -arch $arch -show-build "$f" | awk '/minos/ {print $2}')
+              echo "$f ($arch): minos $v"
+              [ "$v" = "$MIN_MACOS" ] || { echo "::error::$f ($arch) needs macOS $v"; exit 1; }
+            done
+          done
+          otool -L sd-server
+
+      - name: Pack
+        run: |
+          cp ggml/LICENSE build/bin/ggml.txt
+          cp LICENSE build/bin/stable-diffusion.cpp.txt
+          zip -j "sd-master-$ENGINE_SHORT-bin-Darwin-macOS-$MIN_MACOS-arm64.zip" build/bin/*
+          ls -la *.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-metal
+          path: "*.zip"
+
+  # The engine must start on the oldest supported macOS and see the Metal device.
+  smoke:
+    needs: build
+    runs-on: macos-15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: engine-metal
+      - name: Engine starts on macOS 15
+        run: |
+          sw_vers
+          mkdir e && cd e && unzip -q ../*.zip
+          ./sd-server --help > help.txt 2>&1 || true
+          head -5 help.txt && grep -qi usage help.txt
+      # Informational: CI VMs may not expose a usable GPU. The real check is a user on macOS 15.
+      - name: Metal backend loads
+        continue-on-error: true
+        run: |
+          cd e
+          # No model: the server exits, but ggml logs the Metal device it initialised first.
+          ./sd-server --diffusion-model none.gguf --backend mtl0 > run.txt 2>&1 || true
+          cat run.txt | head -40
+          grep -qi "metal" run.txt
+
+  release:
+    needs: smoke
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: engine-metal
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="kokon-macos-$ENGINE_SHORT"
+          sha256sum *.zip | tee SHA256SUMS.txt
+          export GH_REPO="$GITHUB_REPOSITORY"
+          # Kokon pins these files by SHA-256 and rebuilds are not byte-identical: never replace a
+          # published engine. A new engine = a new commit = a new tag.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already published: keeping its files (this build is in the run's artifacts)."
+            exit 0
+          fi
+          gh release create "$TAG" --prerelease --target "$GITHUB_SHA" \
+            --title "Kokon macOS engine ($ENGINE_SHORT)" \
+            --notes "stable-diffusion.cpp $ENGINE_SHORT for Kokon: Metal, universal binary, macOS $MIN_MACOS or newer (upstream's build needs macOS 26). Same flags as upstream otherwise." \
+            *.zip SHA256SUMS.txt
