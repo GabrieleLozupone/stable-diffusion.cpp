@@ -8,6 +8,7 @@ name: Kokon Linux engine
 on:
   push:
     branches: [kokon-linux]
+    paths-ignore: [".github/workflows/kokon-macos.yml"]
   workflow_dispatch:
 
 env:
