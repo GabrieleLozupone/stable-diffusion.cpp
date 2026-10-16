@@ -126,9 +126,9 @@ jobs:
       - name: CUDA engine loads (runtime unpacked next to it)
         run: |
           mkdir c && cd c && unzip -q ../*-cuda12.zip && unzip -q -o ../cudart-sd-bin-linux-cu12-x64.zip
-          ./sd-server --help > help.txt 2>&1 || true
-          head -5 help.txt && grep -qi usage help.txt
-          # No GPU driver in CI, so only libcuda.so.1 (from the driver) may be missing.
+          # sd-server links libcuda.so.1, which only the NVIDIA driver provides (none in CI), so it
+          # can't start here: check that every other library resolves. Run on a real GPU before use.
+          ldd sd-server libggml-cuda.so | grep 'not found' | sort -u
           ! ldd sd-server libggml-cuda.so | grep 'not found' | grep -v 'libcuda.so.1'
 
   release:
@@ -148,7 +148,13 @@ jobs:
           TAG="kokon-linux-$SHORT"
           sha256sum *.zip | tee SHA256SUMS.txt
           export GH_REPO="$GITHUB_REPOSITORY"
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --prerelease --target "$GITHUB_SHA" \
+          # Kokon pins these files by SHA-256 and rebuilds are not byte-identical: never replace a
+          # published engine. A new engine = a new commit = a new tag.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already published: keeping its files (this build is in the run's artifacts)."
+            exit 0
+          fi
+          gh release create "$TAG" --prerelease --target "$GITHUB_SHA" \
             --title "Kokon Linux engine ($SHORT)" \
-            --notes "stable-diffusion.cpp $SHORT (upstream master-964-$SHORT) built on Ubuntu 22.04 for Kokon: Vulkan, CUDA 12.8 (+ runtime). Same flags and CUDA architectures as upstream's Windows builds."
-          gh release upload "$TAG" *.zip SHA256SUMS.txt --clobber
+            --notes "stable-diffusion.cpp $SHORT built on Ubuntu 22.04 for Kokon: Vulkan, CUDA 12.8 (+ runtime). Same flags and CUDA architectures as upstream's Windows builds." \
+            *.zip SHA256SUMS.txt
