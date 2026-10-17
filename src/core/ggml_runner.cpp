@@ -237,8 +237,10 @@ void GGMLRunner::pin_multi_device_nodes(ggml_backend_sched_t sched, ggml_cgraph*
 }
 
 size_t GGMLRunner::retained_runtime_buffer_bytes(ggml_backend_t backend) const {
-    backend      = backend == nullptr ? runtime_backend : backend;
-    size_t bytes = workspace_.bytes(backend);
+    backend                       = backend == nullptr ? runtime_backend : backend;
+    size_t bytes                  = workspace_.bytes(backend);
+    const size_t persistent_bytes = persistent_buffer_bytes(backend);
+    bytes                         = persistent_bytes > SIZE_MAX - bytes ? SIZE_MAX : bytes + persistent_bytes;
     if (backend == runtime_backend) {
         const size_t cache_bytes = cache_.resident_bytes(ggml_backend_get_device(backend));
         bytes                    = cache_bytes > SIZE_MAX - bytes ? SIZE_MAX : bytes + cache_bytes;

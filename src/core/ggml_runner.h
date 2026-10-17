@@ -270,6 +270,10 @@ protected:
 
     size_t retained_runtime_buffer_bytes(ggml_backend_t backend = nullptr) const;
 
+    // Buffers a runner owns across graphs besides its caches (e.g. an LLM KV cache), so the
+    // residency manager can account for them.
+    virtual size_t persistent_buffer_bytes(ggml_backend_t backend) const { return 0; }
+
     void sync_runtime_residency();
 
     std::optional<sd::Tensor<float>> read_graph_tensor(ggml_tensor* tensor, const char* label);
