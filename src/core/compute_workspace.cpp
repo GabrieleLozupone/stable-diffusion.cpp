@@ -43,7 +43,8 @@ namespace sd {
     ggml_backend_sched_t ComputeWorkspace::make_scheduler(size_t graph_size) {
         std::vector<ggml_backend_t> backends{backend_};
         backends.insert(backends.end(), extra_backends_.begin(), extra_backends_.end());
-        if (!sd_backend_is_cpu(backend_)) {
+        // A runner that computes layers on the CPU brings its CPU backend (last in extra_backends_).
+        if (!sd_backend_is_cpu(backend_) && (extra_backends_.empty() || !sd_backend_is_cpu(extra_backends_.back()))) {
             if (cpu_backend_ == nullptr) {
                 cpu_backend_ = sd_backend_cpu_init();
             }
@@ -54,7 +55,7 @@ namespace sd {
         }
         std::vector<ggml_backend_buffer_type_t> bufts;
         for (auto backend : backends) {
-            auto buft = backend == cpu_backend_
+            auto buft = backend != backend_ && sd_backend_is_cpu(backend)
                             ? ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend_))
                             : nullptr;
             bufts.push_back(buft != nullptr ? buft : ggml_backend_get_default_buffer_type(backend));

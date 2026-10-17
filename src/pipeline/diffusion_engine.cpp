@@ -397,6 +397,15 @@ LLM::LLMRunner* StableDiffusionGGML::prepare_text_generation(int64_t n_ctx) {
         if (moved > 0) {
             LOG_INFO("text generation needs %.2f MB of VRAM, %.2f MB available: moved %.2f MB of other models to RAM",
                      need / (1024.0 * 1024.0), available / (1024.0 * 1024.0), moved / (1024.0 * 1024.0));
+            available = budget > 0 ? budget - std::min(budget, model_manager->device_resident_bytes(backend)) : available + moved;
+        }
+        // Still too small: compute the layers that do not fit on the CPU, where te=cpu weights live,
+        // instead of copying them to the GPU for every token.
+        ggml_backend_t params_backend = params_backend_for(SDBackendModule::TE);
+        constexpr size_t decode_bytes = 512ULL * 1024ULL * 1024ULL;
+        if (llm.text_params_bytes() + kv_bytes + decode_bytes > available && !llm.cpu_layers_enabled() &&
+            sd_backend_is_cpu(params_backend) && available > kv_bytes + decode_bytes) {
+            llm.enable_cpu_layers(params_backend, available - kv_bytes - decode_bytes);
         }
     }
     return &llm;

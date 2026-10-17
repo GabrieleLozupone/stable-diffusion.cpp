@@ -1529,6 +1529,9 @@ namespace LLM {
     struct LLMKVCache {
         ggml_context* ctx            = nullptr;
         ggml_backend_buffer_t buffer = nullptr;
+        // Rows of the layers computed on the CPU (LLMRunner::enable_cpu_layers).
+        ggml_context* host_ctx            = nullptr;
+        ggml_backend_buffer_t host_buffer = nullptr;
         std::vector<ggml_tensor*> k;  // per layer: [capacity, num_kv_heads * head_dim], F16
         std::vector<ggml_tensor*> v;
         int64_t capacity = 0;
@@ -1541,15 +1544,19 @@ namespace LLM {
         int64_t n_kv      = 0;
 
         bool active() const {
-            return buffer != nullptr;
+            return capacity > 0;
         }
 
         void release() {
-            if (buffer != nullptr) {
-                ggml_backend_buffer_free(buffer);
+            for (auto b : {buffer, host_buffer}) {
+                if (b != nullptr) {
+                    ggml_backend_buffer_free(b);
+                }
             }
-            if (ctx != nullptr) {
-                ggml_free(ctx);
+            for (auto c : {ctx, host_ctx}) {
+                if (c != nullptr) {
+                    ggml_free(c);
+                }
             }
             *this = LLMKVCache();
         }
@@ -2295,6 +2302,7 @@ namespace LLM {
         std::array<std::vector<float>, 4> pos_embed_weight_data_;
         LLMKVCache kv_cache_;
         std::vector<int32_t> kv_rows_vec_;
+        std::vector<bool> kv_layer_on_cpu_;  // empty: every layer on the compute backend
         // Decode steps run one reused graph, which reads its inputs from these fixed addresses.
         sd::Tensor<int32_t> decode_ids_ = sd::Tensor<int32_t>::from_vector({0});
 
@@ -2537,10 +2545,73 @@ namespace LLM {
         }
 
         size_t persistent_buffer_bytes(ggml_backend_t backend) const override {
-            if (backend != runtime_backend || !kv_cache_.active() || ggml_backend_buffer_is_host(kv_cache_.buffer)) {
+            if (backend != runtime_backend || kv_cache_.buffer == nullptr || ggml_backend_buffer_is_host(kv_cache_.buffer)) {
                 return 0;
             }
             return ggml_backend_buffer_get_size(kv_cache_.buffer);
+        }
+
+        // CPU/GPU split for VRAM budgets below the text weights (like llama.cpp -ngl): the LM head (the
+        // largest matrix) and the first decoder layers whose weights fit in gpu_bytes run on the compute
+        // backend; the other layers and the token embedding run on cpu_backend, where te=cpu weights
+        // already live, instead of being copied to the GPU for every token. Their KV rows live in RAM.
+        void enable_cpu_layers(ggml_backend_t cpu_backend, size_t gpu_bytes) {
+            GGML_ASSERT(cpu_backend != nullptr && sd_backend_is_cpu(cpu_backend) && !sd_backend_is_cpu(runtime_backend));
+            set_runtime_backends({cpu_backend});
+            set_graph_cut_layer_split_enabled(true);
+            set_graph_cut_layer_split_backend_vram_limits({max_graph_vram_bytes, 0});
+            std::map<std::string, ggml_tensor*> tensors;
+            model.get_param_tensors(tensors, "llm");
+            std::vector<size_t> layer_bytes(config.num_layers, 0);
+            auto layer_of = [&](const std::string& name) -> int {
+                const std::string key = "llm.model.layers.";
+                if (name.compare(0, key.size(), key) != 0) {
+                    return -1;
+                }
+                return std::stoi(name.substr(key.size()));
+            };
+            for (const auto& [name, tensor] : tensors) {
+                const int layer = layer_of(name);
+                if (layer >= 0) {
+                    layer_bytes[layer] += ggml_nbytes(tensor);
+                }
+            }
+            kv_layer_on_cpu_.assign(config.num_layers, true);
+            const size_t head_bytes = model.has_lm_head() ? ggml_nbytes(tensors.at("llm.lm_head.weight")) : 0;
+            const bool head_on_gpu  = head_bytes > 0 && head_bytes <= gpu_bytes;
+            size_t used             = head_on_gpu ? head_bytes : 0;
+            int n_gpu               = 0;
+            while (n_gpu < config.num_layers && used + layer_bytes[n_gpu] <= gpu_bytes) {
+                used += layer_bytes[n_gpu];
+                kv_layer_on_cpu_[n_gpu++] = false;
+            }
+            for (const auto& [name, tensor] : tensors) {
+                const int layer = layer_of(name);
+                bool on_cpu     = layer >= 0 ? kv_layer_on_cpu_[layer] : name.find("embed_tokens") != std::string::npos;
+                if (name.compare(0, 11, "llm.lm_head") == 0 || (layer < 0 && name.find("model.norm") != std::string::npos)) {
+                    on_cpu = !head_on_gpu;
+                }
+                graph_cut_layer_split_assignments_[tensor] = on_cpu ? cpu_backend : runtime_backend;
+            }
+            LOG_INFO("%s text generation: %d of %d layers on %s (%.2f MB), the rest on the CPU", get_desc().c_str(), n_gpu,
+                     config.num_layers, ggml_backend_name(runtime_backend), used / (1024.0 * 1024.0));
+        }
+
+        bool cpu_layers_enabled() const {
+            return !kv_layer_on_cpu_.empty();
+        }
+
+        // Weights a text generation step uses (everything but the vision tower).
+        size_t text_params_bytes() {
+            std::map<std::string, ggml_tensor*> tensors;
+            model.get_param_tensors(tensors, "llm");
+            size_t bytes = 0;
+            for (const auto& [name, tensor] : tensors) {
+                if (name.compare(0, 11, "llm.visual.") != 0) {
+                    bytes += ggml_nbytes(tensor);
+                }
+            }
+            return bytes;
         }
 
         std::string get_desc() override {
@@ -2853,23 +2924,41 @@ namespace LLM {
             }
             const int64_t capacity = GGML_PAD(n_ctx, LLM_KV_CACHE_PAD);
             const int64_t row      = static_cast<int64_t>(config.num_kv_heads) * config.head_dim;
-            kv_cache_.ctx          = ggml_init({2 * static_cast<size_t>(config.num_layers) * ggml_tensor_overhead(), nullptr, true});
+            const size_t ctx_size  = 2 * static_cast<size_t>(config.num_layers) * ggml_tensor_overhead();
+            kv_cache_.ctx          = ggml_init({ctx_size, nullptr, true});
             GGML_ASSERT(kv_cache_.ctx != nullptr);
+            int n_host = 0;
             for (int64_t i = 0; i < config.num_layers; i++) {
-                kv_cache_.k.push_back(ggml_new_tensor_2d(kv_cache_.ctx, GGML_TYPE_F16, row, capacity));
-                kv_cache_.v.push_back(ggml_new_tensor_2d(kv_cache_.ctx, GGML_TYPE_F16, row, capacity));
+                const bool host = cpu_layers_enabled() && kv_layer_on_cpu_[i];
+                if (host && kv_cache_.host_ctx == nullptr) {
+                    kv_cache_.host_ctx = ggml_init({ctx_size, nullptr, true});
+                    GGML_ASSERT(kv_cache_.host_ctx != nullptr);
+                }
+                ggml_context* ctx = host ? kv_cache_.host_ctx : kv_cache_.ctx;
+                kv_cache_.k.push_back(ggml_new_tensor_2d(ctx, GGML_TYPE_F16, row, capacity));
+                kv_cache_.v.push_back(ggml_new_tensor_2d(ctx, GGML_TYPE_F16, row, capacity));
+                n_host += host;
             }
-            kv_cache_.buffer = ggml_backend_alloc_ctx_tensors(kv_cache_.ctx, runtime_backend);
-            if (kv_cache_.buffer == nullptr) {
+            if (n_host < config.num_layers) {
+                kv_cache_.buffer = ggml_backend_alloc_ctx_tensors(kv_cache_.ctx, runtime_backend);
+            }
+            if (n_host > 0) {
+                kv_cache_.host_buffer = ggml_backend_alloc_ctx_tensors(kv_cache_.host_ctx, extra_runtime_backends.front());
+            }
+            if ((n_host < config.num_layers && kv_cache_.buffer == nullptr) || (n_host > 0 && kv_cache_.host_buffer == nullptr)) {
                 LOG_ERROR("%s failed to allocate the KV cache for %" PRId64 " tokens", get_desc().c_str(), capacity);
                 kv_cache_.release();
                 return false;
             }
             // Masked rows get zero attention weight, but 0 * NaN in uninitialized memory is still NaN.
-            ggml_backend_buffer_clear(kv_cache_.buffer, 0);
+            for (auto b : {kv_cache_.buffer, kv_cache_.host_buffer}) {
+                if (b != nullptr) {
+                    ggml_backend_buffer_clear(b, 0);
+                }
+            }
             kv_cache_.capacity = capacity;
-            LOG_DEBUG("%s KV cache: %" PRId64 " tokens, %.2f MB", get_desc().c_str(), capacity,
-                      ggml_backend_buffer_get_size(kv_cache_.buffer) / (1024.0 * 1024.0));
+            LOG_DEBUG("%s KV cache: %" PRId64 " tokens, %d of %d layers in RAM", get_desc().c_str(), capacity, n_host,
+                      static_cast<int>(config.num_layers));
             sync_runtime_residency();
             return true;
         }
