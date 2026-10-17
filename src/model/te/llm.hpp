@@ -2918,6 +2918,24 @@ namespace LLM {
             return logits;
         }
 
+        // Image embeddings are computed before a generation starts, so the vision tower's weights staged by
+        // encode_image_outputs() and its compute buffer only take VRAM from the text weights while decoding.
+        void release_vision_buffers() {
+            if (!enable_vision) {
+                return;
+            }
+            std::map<std::string, ggml_tensor*> tensors;
+            model.vision_model()->get_param_tensors(tensors, "visual");
+            std::vector<ggml_tensor*> params;
+            params.reserve(tensors.size());
+            for (const auto& entry : tensors) {
+                params.push_back(entry.second);
+            }
+            evict_compute_backend_param_tensors(params);
+            workspace_.release();
+            sync_runtime_residency();
+        }
+
         // Greedy decoding. Every generated token, stop token included, is passed to on_token with its
         // logits; on_token returns false to stop early. Releases the KV cache and the runner at the end.
         bool generate_greedy(const int n_threads,
@@ -2930,6 +2948,7 @@ namespace LLM {
                              std::vector<int32_t>& tokens,
                              const std::function<bool(int32_t, const sd::Tensor<float>&)>& on_token = nullptr) {
             tokens.clear();
+            release_vision_buffers();
             bool ok = max_new_tokens > 0 && init_kv_cache(input_ids.numel() + max_new_tokens);
             if (ok) {
                 auto logits = compute_logits_cached(n_threads, input_ids, image_embeds, deepstack_image_embeds, image_grids);
