@@ -2171,6 +2171,26 @@ namespace LLM {
             return model->embed(ctx, input_ids);
         }
 
+        bool has_lm_head() const {
+            return blocks.count("lm_head") > 0;
+        }
+
+        // Only text generation uses the LM head, so it is created on demand and text encoders never load it.
+        void init_lm_head(ggml_context* ctx,
+                          const String2TensorStorage& tensor_storage_map,
+                          const std::string& prefix,
+                          std::map<std::string, ggml_tensor*>& tensors) {
+            auto lm_head = std::make_shared<Linear>(config.hidden_size, config.vocab_size, false);
+            lm_head->init(ctx, tensor_storage_map, prefix + ".lm_head");
+            lm_head->get_param_tensors(tensors, prefix + ".lm_head");
+            blocks["lm_head"] = lm_head;
+        }
+
+        ggml_tensor* lm_head_forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            auto lm_head = std::dynamic_pointer_cast<Linear>(blocks["lm_head"]);
+            return lm_head->forward(ctx, x);
+        }
+
         std::shared_ptr<VisionModel> vision_model() {
             GGML_ASSERT(enable_vision);
             return std::dynamic_pointer_cast<VisionModel>(blocks["visual"]);
@@ -2449,6 +2469,25 @@ namespace LLM {
             model.get_param_tensor_ops(tensor_ops);
         }
 
+        // Creates the LM head on first use. New tensors are returned for the caller to register with
+        // the weight manager; tensors stays empty when the head already exists.
+        bool init_lm_head(const String2TensorStorage& tensor_storage_map,
+                          const std::string& prefix,
+                          std::map<std::string, ggml_tensor*>& tensors) {
+            tensors.clear();
+            if (model.has_lm_head()) {
+                return true;
+            }
+            if (!config.final_norm || tensor_storage_map.count(prefix + ".lm_head.weight") == 0) {
+                LOG_ERROR("%s weights have no LM head (lm_head.weight or output.weight), text generation is not available",
+                          get_desc().c_str());
+                return false;
+            }
+            model.init_lm_head(params_ctx, tensor_storage_map, prefix, tensors);
+            params_tensor_set_dirty_ = true;
+            return true;
+        }
+
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* input_ids,
                              ggml_tensor* input_pos,
@@ -2488,7 +2527,8 @@ namespace LLM {
                                  const std::vector<ImageGrid>& image_grids,
                                  std::set<int> out_layers,
                                  bool return_all_hidden_states           = false,
-                                 const sd::Tensor<int32_t>& position_ids = {}) {
+                                 const sd::Tensor<int32_t>& position_ids = {},
+                                 bool last_token_logits                  = false) {
             ggml_cgraph* gf        = new_graph_custom(LLM_GRAPH_SIZE);
             ggml_tensor* input_ids = make_input(input_ids_tensor);
             std::vector<std::pair<int, ggml_tensor*>> image_embeds;
@@ -2616,6 +2656,16 @@ namespace LLM {
                                                  deepstack_image_embeds,
                                                  out_layers,
                                                  return_all_hidden_states);
+            if (last_token_logits) {
+                // Sampling the next token only needs the last position.
+                hidden_states = ggml_view_2d(compute_ctx,
+                                             hidden_states,
+                                             hidden_states->ne[0],
+                                             1,
+                                             hidden_states->nb[1],
+                                             (hidden_states->ne[1] - 1) * hidden_states->nb[1]);
+                hidden_states = model.lm_head_forward(&runner_ctx, hidden_states);
+            }
 
             ggml_build_forward_expand(gf, hidden_states);
 
@@ -2644,6 +2694,28 @@ namespace LLM {
             };
             return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, auto_runner_end),
                                                    input_ids.dim() + 1);
+        }
+
+        // Next-token logits after the whole sequence: [vocab_size, 1]. Call init_lm_head() first.
+        sd::Tensor<float> compute_logits(const int n_threads,
+                                         const sd::Tensor<int32_t>& input_ids,
+                                         const ImageEmbeds& image_embeds                    = {},
+                                         const DeepStackImageEmbeds& deepstack_image_embeds = {},
+                                         const std::vector<ImageGrid>& image_grids          = {},
+                                         bool auto_runner_end                               = true) {
+            GGML_ASSERT(model.has_lm_head());
+            auto get_graph = [&]() -> ggml_cgraph* {
+                return build_graph(input_ids,
+                                   {},
+                                   image_embeds,
+                                   deepstack_image_embeds,
+                                   image_grids,
+                                   {},
+                                   false,
+                                   {},
+                                   true);
+            };
+            return take_or_empty(GGMLRunner::compute(get_graph, n_threads, auto_runner_end));
         }
 
         // LLaDA-Image's QueryFormer consumes the raw token embeddings before the backbone runs,

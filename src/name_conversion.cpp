@@ -198,6 +198,10 @@ std::string convert_cond_stage_model_name(std::string name, std::string prefix, 
         } else {
             replace_with_name_map(name, llm_name_map);
             name = convert_llada2_moe_te_name(name);
+            // llama.cpp calls the LM head "output"; the name map above cannot match it safely.
+            if (name == "llm.output.weight") {
+                name = "llm.lm_head.weight";
+            }
         }
     } else {
         name = convert_open_clip_to_hf_clip_name(name);
