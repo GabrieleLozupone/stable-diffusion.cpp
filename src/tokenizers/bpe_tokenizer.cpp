@@ -248,5 +248,23 @@ bool BPETokenizer::encode(const std::string& text, std::vector<int>& result, on_
 }
 
 std::string BPETokenizer::decode_token(int token_id) const {
-    return utf32_to_utf8(decoder.at(token_id));
+    auto iter = decoder.find(token_id);
+    if (iter == decoder.end()) {
+        return "";
+    }
+    if (!byte_level_bpe) {
+        return utf32_to_utf8(iter->second);
+    }
+    // Byte-level BPE stores every byte as a printable code point; map them back to the raw bytes.
+    // The result can end inside a UTF-8 sequence that the next token completes.
+    std::string bytes;
+    for (char32_t ch : iter->second) {
+        auto byte = byte_decoder.find(std::u32string(1, ch));
+        if (byte != byte_decoder.end()) {
+            bytes += static_cast<char>(byte->second);
+        } else {
+            bytes += utf32_to_utf8(std::u32string(1, ch));
+        }
+    }
+    return bytes;
 }

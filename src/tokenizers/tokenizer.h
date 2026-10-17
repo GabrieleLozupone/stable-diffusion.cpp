@@ -10,6 +10,8 @@
 using on_new_token_cb_t = std::function<bool(std::string&, std::vector<int32_t>&)>;
 
 class Tokenizer {
+    friend class TokenStreamDecoder;
+
 protected:
     std::vector<std::string> special_tokens;
     bool add_bos_token          = false;
@@ -52,6 +54,26 @@ public:
                     size_t max_length          = 100000000,
                     bool allow_overflow_expand = false);
     virtual bool decode(const std::vector<int>& tokens, std::string& text, std::string* error = nullptr) const;
+};
+
+// Decodes generated tokens one at a time. Unlike Tokenizer::decode, the text is kept verbatim.
+// Bytes of a character split across tokens are held back until it is complete, so every returned
+// chunk is valid UTF-8; invalid bytes become U+FFFD.
+class TokenStreamDecoder {
+private:
+    const Tokenizer& tokenizer_;
+    bool skip_special_tokens_;
+    std::string pending_;
+
+    std::string take_text(bool end_of_stream);
+
+public:
+    explicit TokenStreamDecoder(const Tokenizer& tokenizer, bool skip_special_tokens = true);
+
+    // Returns the text completed by this token; it may be empty.
+    std::string push(int token_id);
+    // Returns what is still held back at the end of the stream and resets the decoder.
+    std::string flush();
 };
 
 #endif  // __SD_TOKENIZERS_TOKENIZER_H__

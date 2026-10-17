@@ -229,3 +229,76 @@ bool Tokenizer::decode(const std::vector<int>& tokens, std::string& text, std::s
     text = trim(text);
     return true;
 }
+
+// Length of the valid UTF-8 sequence at text[pos]; 0 if the text ends inside a valid prefix;
+// -n if the first n bytes are an invalid prefix (replaced by one U+FFFD, as Python does).
+static int utf8_sequence_length(const std::string& text, size_t pos) {
+    const unsigned char lead = static_cast<unsigned char>(text[pos]);
+    if (lead < 0x80) {
+        return 1;
+    }
+    int length       = 0;
+    unsigned char lo = 0x80;
+    unsigned char hi = 0xBF;
+    if (lead >= 0xC2 && lead <= 0xDF) {
+        length = 2;
+    } else if (lead >= 0xE0 && lead <= 0xEF) {
+        length = 3;
+        lo     = lead == 0xE0 ? 0xA0 : 0x80;
+        hi     = lead == 0xED ? 0x9F : 0xBF;
+    } else if (lead >= 0xF0 && lead <= 0xF4) {
+        length = 4;
+        lo     = lead == 0xF0 ? 0x90 : 0x80;
+        hi     = lead == 0xF4 ? 0x8F : 0xBF;
+    } else {
+        return -1;
+    }
+    for (int i = 1; i < length; i++) {
+        if (pos + i >= text.size()) {
+            return 0;
+        }
+        const unsigned char c = static_cast<unsigned char>(text[pos + i]);
+        if (c < lo || c > hi) {
+            return -i;
+        }
+        lo = 0x80;
+        hi = 0xBF;
+    }
+    return length;
+}
+
+TokenStreamDecoder::TokenStreamDecoder(const Tokenizer& tokenizer, bool skip_special_tokens)
+    : tokenizer_(tokenizer), skip_special_tokens_(skip_special_tokens) {
+}
+
+std::string TokenStreamDecoder::take_text(bool end_of_stream) {
+    std::string text;
+    size_t pos = 0;
+    while (pos < pending_.size()) {
+        int length = utf8_sequence_length(pending_, pos);
+        if (length > 0) {
+            text.append(pending_, pos, length);
+            pos += length;
+        } else if (length == 0 && !end_of_stream) {
+            break;
+        } else {
+            text += "\xEF\xBF\xBD";
+            pos = length == 0 ? pending_.size() : pos - length;
+        }
+    }
+    pending_.erase(0, pos);
+    return text;
+}
+
+std::string TokenStreamDecoder::push(int token_id) {
+    std::string piece = tokenizer_.decode_token(token_id);
+    if (skip_special_tokens_ && tokenizer_.is_special_token(piece)) {
+        return "";
+    }
+    pending_ += piece;
+    return take_text(false);
+}
+
+std::string TokenStreamDecoder::flush() {
+    return take_text(true);
+}
