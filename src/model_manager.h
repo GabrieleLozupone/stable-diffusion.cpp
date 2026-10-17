@@ -79,6 +79,14 @@ private:
         std::vector<std::unique_ptr<ComputeStagingBlock>> staging_blocks;
     };
 
+    // A device params block moved to host memory by offload_params_to_host().
+    struct OffloadedBlock {
+        ParamsStorageBlock* block                = nullptr;
+        ggml_backend_buffer_type_t device_buft   = nullptr;
+        size_t device_size                       = 0;
+        std::vector<std::pair<TensorState*, size_t>> offsets;  // tensor offsets from the buffer base
+    };
+
     struct RuntimeResidency {
         ggml_backend_t compute_backend = nullptr;
         size_t resident_bytes          = 0;
@@ -112,6 +120,8 @@ private:
     int n_threads_                   = 0;
     bool enable_mmap_                = false;
     bool writable_mmap_              = false;
+    std::vector<OffloadedBlock> offloaded_blocks_;
+    std::unordered_set<TensorState*> offloaded_states_;
     bool segmented_compute_disabled_ = false;
     bool prefetch_disabled_          = false;
 
@@ -264,6 +274,14 @@ public:
                                       params_backend,
                                       registered_tensor_size);
     }
+
+    // Moves the device-resident params of these components to host memory (pinned when the device
+    // offers it), so another runner can use the device. Each block comes back on its next use
+    // (prepare_params) or with restore_offloaded_params(). Returns the bytes moved.
+    size_t offload_params_to_host(const std::set<ModelComponent>& components);
+    bool restore_offloaded_params();
+    size_t offloaded_params_bytes() const;
+    size_t device_resident_bytes(ggml_backend_t backend) const { return compute_backend_resident_bytes(backend); }
 
     bool validate_registered_tensors();
     bool load_all_params_eagerly();

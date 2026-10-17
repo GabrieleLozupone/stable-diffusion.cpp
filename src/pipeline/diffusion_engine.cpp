@@ -348,6 +348,60 @@ size_t StableDiffusionGGML::max_graph_vram_bytes_for_module(SDBackendModule modu
     return max_vram_assignment.bytes_for_backend(backend_for(module));
 }
 
+LLM::LLMRunner* StableDiffusionGGML::prepare_text_generation(int64_t n_ctx) {
+    auto embedder = std::dynamic_pointer_cast<LLMEmbedder>(cond_stage_model);
+    if (embedder == nullptr || embedder->llm == nullptr || !embedder->llm->supports_kv_cache()) {
+        LOG_ERROR("text generation needs a causal LLM text encoder");
+        return nullptr;
+    }
+    LLM::LLMRunner& llm = *embedder->llm;
+    if (!llm.model.has_lm_head()) {
+        std::map<std::string, ggml_tensor*> head;
+        if (!llm.init_lm_head(model_manager->loader().get_tensor_storage_map(), "text_encoders.llm", head) ||
+            !model_manager->register_param_tensors(ModelComponent::Conditioner,
+                                                   head,
+                                                   ModelManager::ResidencyMode::ParamBackend,
+                                                   backend_for(SDBackendModule::TE),
+                                                   params_backend_for(SDBackendModule::TE)) ||
+            !model_manager->validate_registered_tensors()) {
+            LOG_ERROR("failed to create the LM head");
+            return nullptr;
+        }
+    }
+
+    ggml_backend_t backend = backend_for(SDBackendModule::TE);
+    if (sd_backend_is_cpu(backend)) {
+        return &llm;
+    }
+    // Weights + F16 KV cache + compute buffers (an image prompt's prefill needs the most).
+    constexpr size_t compute_bytes = 1024ULL * 1024ULL * 1024ULL;
+    const size_t kv_bytes          = 2ULL * llm.config.num_layers * llm.config.num_kv_heads * llm.config.head_dim *
+                            ggml_type_size(GGML_TYPE_F16) * static_cast<size_t>(GGML_PAD(n_ctx, LLM::LLM_KV_CACHE_PAD));
+    const size_t need     = model_manager->registered_params_size({ModelComponent::Conditioner}) + kv_bytes + compute_bytes;
+    const size_t budget   = max_graph_vram_bytes_for_module(SDBackendModule::TE);
+    const size_t resident = model_manager->device_resident_bytes(backend);
+    size_t available      = budget > resident ? budget - resident : 0;
+    if (budget == 0) {
+        size_t free_bytes = 0, total_bytes = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_bytes, &total_bytes);
+        available = free_bytes;
+    }
+    if (need > available) {
+        std::set<ModelComponent> others;
+        for (int i = 0; i < static_cast<int>(ModelComponent::Count); ++i) {
+            if (static_cast<ModelComponent>(i) != ModelComponent::Conditioner) {
+                others.insert(static_cast<ModelComponent>(i));
+            }
+        }
+        const size_t moved = model_manager->offload_params_to_host(others);
+        if (moved > 0) {
+            LOG_INFO("text generation needs %.2f MB of VRAM, %.2f MB available: moved %.2f MB of other models to RAM",
+                     need / (1024.0 * 1024.0), available / (1024.0 * 1024.0), moved / (1024.0 * 1024.0));
+        }
+    }
+    return &llm;
+}
+
 std::vector<size_t> StableDiffusionGGML::layer_split_vram_limits_for_backends(const std::vector<ggml_backend_t>& backends) {
     std::vector<size_t> limits;
     limits.reserve(backends.size());

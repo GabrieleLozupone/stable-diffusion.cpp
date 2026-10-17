@@ -25,6 +25,9 @@
 
 class RNG;
 struct Denoiser;
+namespace LLM {
+    struct LLMRunner;
+}
 struct LoraModel;
 struct ConditionerParams;
 class ConditioningCache;
@@ -266,6 +269,12 @@ public:
     enum sd_cancel_mode_t get_cancel_flag();
 
     size_t max_graph_vram_bytes_for_module(SDBackendModule module);
+
+    // Text generation with the conditioner's LLM (prompt enhancer): registers its LM head on first use
+    // and, when the LLM's weights, a KV cache of n_ctx tokens and its compute buffers do not fit in the
+    // text encoder's VRAM budget next to the other resident models, moves those models to RAM until
+    // their next use. Returns nullptr if the conditioner cannot generate text.
+    LLM::LLMRunner* prepare_text_generation(int64_t n_ctx);
 
     std::vector<size_t> layer_split_vram_limits_for_backends(const std::vector<ggml_backend_t>& backends);
 
