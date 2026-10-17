@@ -141,6 +141,23 @@ private:
     size_t logged_segment_count_     = 0;
     ggml_status last_compute_status_ = GGML_STATUS_SUCCESS;
 
+    // The last monolithic graph of compute_reusable(), kept with its compute context and allocation:
+    // a call with the same key only refreshes the inputs and runs it again (and lets the backend
+    // replay it, e.g. as a CUDA graph).
+    struct ReusableGraph {
+        bool valid               = false;
+        uint64_t key             = 0;
+        ggml_cgraph* graph       = nullptr;
+        ggml_tensor* output      = nullptr;
+        uint64_t workspace_epoch = 0;
+        std::vector<std::pair<const ggml_tensor*, const void*>> params_data;  // weights must not move
+    };
+    ReusableGraph reusable_graph_;
+    bool graph_reuse_enabled_   = true;
+    bool keep_graph_            = false;
+    bool last_graph_monolithic_ = false;
+    ggml_cgraph* last_graph_    = nullptr;
+
     sd::ComputeWorkspace::Measurement measure(ggml_cgraph* graph, size_t direct_bytes);
     std::vector<DeviceMemoryRequest> memory_requests(const std::vector<sd::BackendBufferSize>& sizes,
                                                      size_t pending_cache_bytes) const;
@@ -348,6 +365,16 @@ public:
                                              bool auto_runner_end                      = true,
                                              bool no_return                            = false,
                                              const std::function<bool()>& read_outputs = {});
+
+    // Like compute(get_graph, n_threads, false) for graphs that keep their structure between calls and
+    // only change the data of their inputs (e.g. LLM decode steps): when key, allocation and weights are
+    // the same as for the previous call, the graph is not built again, only its inputs are copied. The
+    // caller must keep the input data at the same addresses, as bound by the get_graph that built it.
+    std::optional<sd::Tensor<float>> compute_reusable(uint64_t key, get_graph_cb_t get_graph, int n_threads);
+
+    void set_graph_reuse_enabled(bool enabled) {
+        graph_reuse_enabled_ = enabled;
+    }
 
     ggml_status last_compute_status() const { return last_compute_status_; }
 

@@ -88,6 +88,7 @@ namespace sd {
 
     bool ComputeWorkspace::allocate(ggml_cgraph* graph, const AssignNodes& assign_nodes) {
         GGML_ASSERT(!active_);
+        ++epoch_;
         const bool use_scheduler = needs_scheduler(graph);
         if (use_scheduler) {
             if (allocator_ != nullptr) {
@@ -253,6 +254,7 @@ namespace sd {
         if (active_) {
             return false;
         }
+        ++epoch_;
         ggml_gallocr_free(allocator_);
         allocator_ = nullptr;
         ggml_backend_sched_free(scheduler_);

@@ -23,6 +23,7 @@ namespace sd {
         std::vector<uint64_t> reservation_;
         bool active_         = false;
         size_t reservations_ = 0;
+        uint64_t epoch_      = 0;
 
         ggml_backend_sched_t make_scheduler(size_t graph_size);
         bool needs_scheduler(ggml_cgraph* graph) const;
@@ -58,6 +59,8 @@ namespace sd {
         ggml_backend_t cpu_backend() const { return cpu_backend_; }
         size_t bytes(ggml_backend_t backend) const;
         size_t reservation_count() const { return reservations_; }
+        // Changes whenever graph tensors may have moved: every allocation and release.
+        uint64_t epoch() const { return epoch_; }
     };
 }
 

@@ -10,6 +10,7 @@
 #include "core/layer_split_partition.h"
 #include "core/segment_graph_bindings.h"
 #include "core/segment_weight_pipeline.h"
+#include "ggml-impl.h"
 
 using namespace sd;
 
@@ -61,6 +62,7 @@ void GGMLRunner::alloc_compute_ctx() {
 }
 
 void GGMLRunner::free_compute_ctx() {
+    reusable_graph_ = ReusableGraph();
     debug_tensors.clear();
     if (compute_ctx != nullptr) {
         ggml_free(compute_ctx);
@@ -483,6 +485,9 @@ void GGMLRunner::runner_end() {
     if (!runner_started_) {
         return;
     }
+    if (reusable_graph_.valid) {
+        free_compute_ctx();
+    }
     workspace_.release();
     cache_.clear();
     logged_compute_bytes_.clear();
@@ -627,7 +632,9 @@ std::optional<sd::Tensor<float>> GGMLRunner::compute(get_graph_cb_t get_graph,
             }
             runner.cache_.graph_end(false);
             runner.cut_cache_.clear();
-            runner.free_compute_ctx();
+            if (!runner.keep_graph_ || !success) {
+                runner.free_compute_ctx();
+            }
             runner.graph_active_ = false;
             if (!success) {
                 runner.workspace_.release();
@@ -640,6 +647,7 @@ std::optional<sd::Tensor<float>> GGMLRunner::compute(get_graph_cb_t get_graph,
     if (!prepare_compute_graph(get_graph, &graph)) {
         return std::nullopt;
     }
+    last_graph_              = graph;
     params_tensor_set_dirty_ = true;
     rebuild_params_tensor_set();
     if (auto manager = residency_manager.lock()) {
@@ -666,6 +674,50 @@ std::optional<sd::Tensor<float>> GGMLRunner::compute(get_graph_cb_t get_graph,
     if (success) {
         cache_.graph_end(true);
         last_compute_status_ = GGML_STATUS_SUCCESS;
+    }
+    return output;
+}
+
+std::optional<sd::Tensor<float>> GGMLRunner::compute_reusable(uint64_t key, get_graph_cb_t get_graph, int n_threads) {
+    auto& reuse = reusable_graph_;
+    if (graph_reuse_enabled_ && reuse.valid && reuse.key == key && runner_started_ && !graph_active_ &&
+        workspace_.epoch() == reuse.workspace_epoch &&
+        std::all_of(reuse.params_data.begin(), reuse.params_data.end(),
+                    [](const auto& entry) { return entry.first->data == entry.second; })) {
+        last_compute_status_ = GGML_STATUS_FAILED;
+        for (const auto& [tensor, data] : backend_tensor_data_map) {
+            ggml_backend_tensor_set(tensor, data, 0, ggml_nbytes(tensor));
+        }
+        graph_active_ = true;
+        const bool ok = execute_segment(reuse.graph, n_threads);
+        graph_active_ = false;
+        if (!ok) {
+            free_compute_ctx();
+            return std::nullopt;
+        }
+        auto output = read_graph_tensor(reuse.output, "output");
+        if (output.has_value()) {
+            last_compute_status_ = GGML_STATUS_SUCCESS;
+        }
+        return output;
+    }
+
+    keep_graph_ = graph_reuse_enabled_;
+    auto output = compute(get_graph, n_threads, false);
+    keep_graph_ = false;
+    if (output.has_value() && graph_reuse_enabled_ && last_graph_monolithic_ && compute_ctx != nullptr) {
+        reuse.valid           = true;
+        reuse.key             = key;
+        reuse.graph           = last_graph_;
+        // A graph id tells the backend the graph is unchanged between calls (CUDA graphs skip their checks).
+        reuse.graph->uid      = ggml_graph_next_uid();
+        reuse.output          = ggml_get_tensor(compute_ctx, final_result_name.c_str());
+        reuse.workspace_epoch = workspace_.epoch();
+        for (ggml_tensor* param : collect_used_param_tensors(last_graph_)) {
+            reuse.params_data.push_back({param, param->data});
+        }
+    } else if (compute_ctx != nullptr) {
+        free_compute_ctx();
     }
     return output;
 }
@@ -875,6 +927,7 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         }
     }
     const auto& plan            = segmented ? cached_plan : monolithic_plan;
+    last_graph_monolithic_      = !segmented;
     const bool segments_changed = plan.segments.size() != logged_segment_count_;
     if (segments_changed && (segmented || logged_segment_count_ > 1)) {
         LOG_VERBOSE("%s using %zu segment%s", get_desc().c_str(),

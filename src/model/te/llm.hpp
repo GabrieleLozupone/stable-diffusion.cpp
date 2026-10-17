@@ -2295,6 +2295,8 @@ namespace LLM {
         std::array<std::vector<float>, 4> pos_embed_weight_data_;
         LLMKVCache kv_cache_;
         std::vector<int32_t> kv_rows_vec_;
+        // Decode steps run one reused graph, which reads its inputs from these fixed addresses.
+        sd::Tensor<int32_t> decode_ids_ = sd::Tensor<int32_t>::from_vector({0});
 
         static ggml_tensor* process_image_common(ggml_context* ctx,
                                                  ggml_tensor* image,
@@ -2896,8 +2898,9 @@ namespace LLM {
                 LOG_ERROR("%s KV cache is full or not initialized", get_desc().c_str());
                 return {};
             }
-            auto get_graph = [&]() -> ggml_cgraph* {
-                return build_graph(input_ids,
+            const bool decode = input_ids.numel() == 1 && image_embeds.empty();
+            auto get_graph    = [&]() -> ggml_cgraph* {
+                return build_graph(decode ? decode_ids_ : input_ids,
                                    {},
                                    image_embeds,
                                    deepstack_image_embeds,
@@ -2908,7 +2911,28 @@ namespace LLM {
                                    true,
                                    true);
             };
-            auto logits = take_or_empty(GGMLRunner::compute(get_graph, n_threads, false));
+            sd::Tensor<float> logits;
+            if (decode) {
+                // The same inputs build_graph() would bind, written in place for a reused graph.
+                const int64_t n_past = kv_cache_.n_past;
+                const int64_t n_kv   = std::min<int64_t>(GGML_PAD(n_past + 1, LLM_KV_CACHE_PAD), kv_cache_.capacity);
+                const int pos        = kv_cache_.next_pos;
+                decode_ids_.data()[0] = input_ids.data()[0];
+                input_pos_vec.resize(4);
+                input_pos_vec[0] = input_pos_vec[1] = input_pos_vec[2] = pos;
+                input_pos_vec[3] = 0;
+                attention_mask_vec.resize(n_kv);
+                for (int64_t i = 0; i < n_kv; i++) {
+                    attention_mask_vec[i] = i <= n_past ? 0.f : -INFINITY;
+                }
+                kv_rows_vec_.resize(1);
+                kv_rows_vec_[0] = static_cast<int32_t>(n_past);
+                kv_cache_.n_kv  = n_kv;
+                const uint64_t key = (static_cast<uint64_t>(kv_cache_.capacity) << 32) | static_cast<uint64_t>(n_kv);
+                logits             = take_or_empty(compute_reusable(key, get_graph, n_threads));
+            } else {
+                logits = take_or_empty(GGMLRunner::compute(get_graph, n_threads, false));
+            }
             if (!logits.empty()) {
                 const int64_t n_tokens = input_ids.numel();
                 kv_cache_.n_past += n_tokens;
