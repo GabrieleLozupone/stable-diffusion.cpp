@@ -555,6 +555,54 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            sd_audio_t** audio_out,
                            int* fps_out);
 
+// Text generation with the LLM text encoder (e.g. a prompt enhancer on Qwen-Image 2.1's Qwen3-VL).
+typedef struct {
+    float temperature;       // <= 0: greedy
+    float top_p;             // >= 1: off
+    int top_k;               // <= 0: off
+    float presence_penalty;  // subtracted from tokens already generated; 0: off
+    int64_t seed;            // < 0: random; the seed used is returned in sd_text_gen_result_t
+} sd_text_sample_params_t;
+
+typedef struct {
+    const char* system_prompt;  // NULL or "": no system turn
+    const char* prompt;
+    const sd_image_t* images;  // shown to the model before the prompt, labelled <image1>, ... when several
+    int images_count;
+    int image_max_pixels;  // 0: images as given, rounded to the vision patch grid
+    int max_tokens;
+    sd_text_sample_params_t sample_params;
+} sd_text_gen_params_t;
+
+enum sd_text_finish_reason_t {
+    SD_TEXT_FINISH_STOP,       // end-of-turn token
+    SD_TEXT_FINISH_LENGTH,     // max_tokens reached
+    SD_TEXT_FINISH_CANCELLED,  // the callback returned false, or sd_cancel_generation()
+};
+
+typedef struct {
+    int64_t seed;
+    int prompt_tokens;
+    int generated_tokens;
+    enum sd_text_finish_reason_t finish_reason;
+    float prepare_s;  // memory planning, including moving other models out of VRAM
+    float image_s;    // vision encoder
+    float prefill_s;  // prompt processing up to the first token
+    float decode_s;   // the remaining tokens
+} sd_text_gen_result_t;
+
+// Receives the text in complete UTF-8 pieces as it is generated; return false to stop.
+typedef bool (*sd_text_cb_t)(const char* piece, void* data);
+
+SD_API bool sd_ctx_supports_text_generation(const sd_ctx_t* sd_ctx);
+SD_API void sd_text_gen_params_init(sd_text_gen_params_t* sd_text_gen_params);
+// Returns the whole generated text (free() it), or NULL on error. on_piece and result may be NULL.
+SD_API char* generate_text(sd_ctx_t* sd_ctx,
+                           const sd_text_gen_params_t* sd_text_gen_params,
+                           sd_text_cb_t on_piece,
+                           void* data,
+                           sd_text_gen_result_t* result);
+
 typedef struct upscaler_ctx_t upscaler_ctx_t;
 
 SD_API upscaler_ctx_t* new_upscaler_ctx(const char* esrgan_path,

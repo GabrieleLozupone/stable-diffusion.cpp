@@ -781,6 +781,39 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
     return sd::pipeline::generate_video(sd_ctx->sd, sd_vid_gen_params, frames_out, num_frames_out, audio_out, fps_out);
 }
 
+SD_API bool sd_ctx_supports_text_generation(const sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    return sd::pipeline::supports_text_generation(sd_ctx->sd);
+}
+
+SD_API void sd_text_gen_params_init(sd_text_gen_params_t* sd_text_gen_params) {
+    *sd_text_gen_params                                = {};
+    sd_text_gen_params->prompt                         = "";
+    sd_text_gen_params->max_tokens                     = 512;
+    sd_text_gen_params->sample_params.temperature      = 0.f;
+    sd_text_gen_params->sample_params.top_p            = 1.f;
+    sd_text_gen_params->sample_params.top_k            = 0;
+    sd_text_gen_params->sample_params.presence_penalty = 0.f;
+    sd_text_gen_params->sample_params.seed             = -1;
+}
+
+SD_API char* generate_text(sd_ctx_t* sd_ctx,
+                           const sd_text_gen_params_t* sd_text_gen_params,
+                           sd_text_cb_t on_piece,
+                           void* data,
+                           sd_text_gen_result_t* result) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_text_gen_params == nullptr) {
+        return nullptr;
+    }
+    StableDiffusionGGML::ExecutionScope execution(*sd_ctx->sd);
+    if (!execution.ready) {
+        return nullptr;
+    }
+    return sd::pipeline::generate_text(sd_ctx->sd, sd_text_gen_params, on_piece, data, result);
+}
+
 SD_API void free_sd_images(sd_image_t* result_images, int num_images) {
     if (result_images == nullptr) {
         return;

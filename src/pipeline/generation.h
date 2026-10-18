@@ -70,6 +70,15 @@ namespace sd::pipeline {
 
     sd::Tensor<float> ensure_image_tensor_channels(sd::Tensor<float> image, int channels);
 
+    bool supports_text_generation(StableDiffusionGGML* sd);
+
+    // Callers hold ExecutionScope.
+    char* generate_text(StableDiffusionGGML* sd,
+                        const sd_text_gen_params_t* params,
+                        sd_text_cb_t on_piece,
+                        void* data,
+                        sd_text_gen_result_t* result);
+
 }  // namespace sd::pipeline
 
 #endif  // __SD_PIPELINE_GENERATION_H__
