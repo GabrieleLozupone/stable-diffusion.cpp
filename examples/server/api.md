@@ -58,6 +58,7 @@ Current endpoints include:
 - `POST /sdcpp/v1/jobs/{id}/cancel`
 - `POST /sdcpp/v1/vid_gen`
 - `POST /sdcpp/v1/upscale`
+- `POST /sdcpp/v1/text_gen`
 
 ## `sd_cpp_extra_args`
 
@@ -473,6 +474,7 @@ Top-level fields:
 | `upscalers` | `array<object>` | Available highres upscalers, built-in and model-backed |
 | `upscale` | `boolean` | Whether a compatible RGB ESRGAN model is available for `POST /sdcpp/v1/upscale` |
 | `preview_modes` | `array<string>` | Available preview modes, e.g. `["none", "proj", "tae", "vae"]` |
+| `text_generation` | `boolean` | Whether `POST /sdcpp/v1/text_gen` works with the loaded model |
 | `limits` | `object` | Shared queue and size limits |
 
 `model`
@@ -531,6 +533,8 @@ Built-in entries include `None`, `Lanczos`, `Nearest`, `Latent`, `Latent (neares
 | `limits.max_queue_size` | `integer` |
 | `limits.max_upscale_width` | `integer` |
 | `limits.max_upscale_height` | `integer` |
+| `limits.max_text_tokens` | `integer` |
+| `limits.max_text_images` | `integer` |
 
 Shared default fields used by both `img_gen` and `vid_gen`:
 
@@ -732,6 +736,76 @@ Notes:
 - The upscaler models are three-channel; alpha is not preserved.
 - The request holds the generation context lock, so an upscale and a
   generation never run on the device at the same time.
+
+#### `POST /sdcpp/v1/text_gen`
+
+Generates text with the LLM that the loaded model uses as its text encoder, for
+example to expand a short instruction into a full prompt (a prompt enhancer).
+It reuses the weights already loaded for conditioning, so no second model is
+needed. Available when `text_generation` is `true` in `/sdcpp/v1/capabilities`;
+currently only Qwen3-VL text encoders (Qwen-Image 2.1) are supported.
+
+Like `/upscale` it is synchronous and does not create a job: it waits for a
+running generation, then holds the generation context lock while it generates.
+If the text encoder does not fit in VRAM next to the other models, they are
+moved to RAM for the duration and come back on the next generation.
+
+Request fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `prompt` | `string` | Required. The user turn |
+| `system_prompt` | `string` | Required. The system turn; `""` sends none. The server has no built-in prompt |
+| `images` | `array<string>` | Optional, up to `limits.max_text_images`. Base64 or data URL images shown before the prompt, labelled `<image1>`, `<image2>`, ... when there are several |
+| `image_max_pixels` | `integer` | `0` (default) uses each image at its own size, rounded to multiples of 32; otherwise larger images are scaled down to this area |
+| `max_tokens` | `integer` | 1 to `limits.max_text_tokens` (default `512`) |
+| `sampling.temperature` | `number` | `0` (default) is greedy decoding |
+| `sampling.top_p` | `number` | `0 < top_p <= 1` (default `1`, off) |
+| `sampling.top_k` | `integer` | `0` (default) is off |
+| `sampling.presence_penalty` | `number` | Subtracted from the logit of every token already generated (prompt tokens are not penalized); default `0` |
+| `sampling.seed` | `integer` | Negative (default) picks a random seed; the seed used is returned |
+| `stream` | `boolean` | Default `true` |
+
+Sampling applies the presence penalty, temperature, top-k and top-p in that
+order (as HF transformers and vLLM do). Qwen recommends `temperature 0.7`,
+`top_p 0.8`, `top_k 20`, `presence_penalty 1.5` for Qwen3-VL. A seed gives the
+same text again on the same build and device.
+
+With `stream: true` the reply is `text/event-stream`:
+
+```text
+: waiting for the model
+
+event: delta
+data: {"text":"A watercolour"}
+
+event: delta
+data: {"text":" painting of"}
+
+event: done
+data: {"text":"A watercolour painting of ...","finish_reason":"stop","seed":1234,"usage":{"prompt_tokens":96,"completion_tokens":131},"timings":{"prepare_s":0.01,"image_s":0.0,"prefill_s":0.05,"decode_s":1.04}}
+```
+
+Every `delta` is complete UTF-8, and the deltas add up to the `done` text. A
+failure after the stream has started ends it with `event: error` and
+`data: {"error": "..."}`. Closing the connection stops the generation.
+
+With `stream: false` the reply is one JSON object with the fields of `done`.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `text` | `string` | The generated text, without the end-of-turn token |
+| `finish_reason` | `string` | `stop`, `length` (`max_tokens` reached) or `cancelled` |
+| `seed` | `integer` | The seed used |
+| `usage.prompt_tokens` | `integer` | Including image tokens |
+| `usage.completion_tokens` | `integer` | |
+| `timings` | `object` | Seconds: `prepare_s` (memory planning), `image_s` (vision encoder), `prefill_s` (up to the first token), `decode_s` (the rest) |
+
+Typical status codes:
+
+- `200 OK`
+- `400 Bad Request` (invalid request, unreadable image, or a model without text generation support)
+- `500 Internal Server Error` (only with `stream: false`; streamed failures use `event: error`)
 
 #### `POST /sdcpp/v1/jobs/{id}/cancel`
 

@@ -13,6 +13,8 @@
 namespace fs = std::filesystem;
 
 static constexpr uint32_t k_max_upscale_dimension = 8192;
+static constexpr int k_max_text_tokens            = 4096;
+static constexpr int k_max_text_images            = 4;
 
 static bool valid_upscale_dimensions(const sd_image_t& image, int factor, int repeats) {
     if (image.width == 0 || image.height == 0 || factor < 1 || repeats < 1 || repeats > 4) {
@@ -396,6 +398,8 @@ static json make_capabilities_json(ServerRuntime& runtime) {
                   {"max_queue_size", manager.max_pending_jobs},
                   {"max_upscale_width", k_max_upscale_dimension},
                   {"max_upscale_height", k_max_upscale_dimension},
+                  {"max_text_tokens", k_max_text_tokens},
+                  {"max_text_images", k_max_text_images},
     };
     result["samplers"]               = samplers;
     result["schedulers"]             = schedulers;
@@ -407,6 +411,7 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     result["upscalers"]              = available_upscalers;
     result["upscale"]                = have_upscaler_models;
     result["preview_modes"]          = make_preview_modes_json();
+    result["text_generation"]        = sd_ctx_supports_text_generation(runtime.sd_ctx);
     return result;
 }
 
@@ -468,12 +473,198 @@ static bool parse_vid_gen_request(const json& body,
     return true;
 }
 
+// One /sdcpp/v1/text_gen request; owns what sd_text_gen_params_t points to.
+struct TextGenRequest {
+    std::string system_prompt;
+    std::string prompt;
+    std::vector<SDImageOwner> image_owners;
+    std::vector<sd_image_t> images;
+    sd_text_gen_params_t params;
+    bool stream = true;
+};
+
+static bool parse_text_gen_request(const json& body, TextGenRequest& request, std::string& error_message) {
+    if (!body.is_object()) {
+        error_message = "body must be an object";
+        return false;
+    }
+    sd_text_gen_params_init(&request.params);
+    if (!body.contains("prompt") || !body["prompt"].is_string() || body["prompt"].get<std::string>().empty()) {
+        error_message = "prompt is required";
+        return false;
+    }
+    if (!body.contains("system_prompt") || !body["system_prompt"].is_string()) {
+        error_message = "system_prompt is required (an empty string means no system prompt)";
+        return false;
+    }
+    request.prompt        = body["prompt"].get<std::string>();
+    request.system_prompt = body["system_prompt"].get<std::string>();
+    request.stream        = body.value("stream", true);
+
+    request.params.max_tokens       = body.value("max_tokens", request.params.max_tokens);
+    request.params.image_max_pixels = body.value("image_max_pixels", 0);
+    if (request.params.max_tokens < 1 || request.params.max_tokens > k_max_text_tokens) {
+        error_message = "max_tokens must be between 1 and " + std::to_string(k_max_text_tokens);
+        return false;
+    }
+    if (request.params.image_max_pixels < 0) {
+        error_message = "image_max_pixels must not be negative";
+        return false;
+    }
+
+    if (body.contains("sampling")) {
+        const json& s = body["sampling"];
+        if (!s.is_object()) {
+            error_message = "sampling must be an object";
+            return false;
+        }
+        sd_text_sample_params_t& sp = request.params.sample_params;
+        sp.temperature              = s.value("temperature", sp.temperature);
+        sp.top_p                    = s.value("top_p", sp.top_p);
+        sp.top_k                    = s.value("top_k", sp.top_k);
+        sp.presence_penalty         = s.value("presence_penalty", sp.presence_penalty);
+        sp.seed                     = s.value("seed", sp.seed);
+        if (!std::isfinite(sp.temperature) || sp.temperature < 0.f || !std::isfinite(sp.top_p) || sp.top_p <= 0.f ||
+            sp.top_p > 1.f || sp.top_k < 0 || !std::isfinite(sp.presence_penalty)) {
+            error_message = "sampling needs temperature >= 0, 0 < top_p <= 1, top_k >= 0 and a finite presence_penalty";
+            return false;
+        }
+    }
+
+    if (body.contains("images")) {
+        const json& images = body["images"];
+        if (!images.is_array() || images.size() > static_cast<size_t>(k_max_text_images)) {
+            error_message = "images must be an array of at most " + std::to_string(k_max_text_images) + " base64 images";
+            return false;
+        }
+        for (const auto& item : images) {
+            SDImageOwner image;
+            if (!item.is_string() || !decode_base64_image(item.get<std::string>(), 3, 0, 0, image) ||
+                image.get().data == nullptr) {
+                error_message = "image " + std::to_string(request.image_owners.size()) + " could not be read";
+                return false;
+            }
+            request.image_owners.push_back(std::move(image));
+        }
+    }
+    for (auto& owner : request.image_owners) {
+        request.images.push_back(owner.get());
+    }
+    request.params.system_prompt = request.system_prompt.c_str();
+    request.params.prompt        = request.prompt.c_str();
+    request.params.images        = request.images.data();
+    request.params.images_count  = static_cast<int>(request.images.size());
+    return true;
+}
+
+static const char* text_finish_reason_name(sd_text_finish_reason_t reason) {
+    switch (reason) {
+        case SD_TEXT_FINISH_STOP:
+            return "stop";
+        case SD_TEXT_FINISH_LENGTH:
+            return "length";
+        default:
+            return "cancelled";
+    }
+}
+
+static json make_text_gen_done_json(const std::string& text, const sd_text_gen_result_t& result) {
+    return {
+        {"text", text},
+        {"finish_reason", text_finish_reason_name(result.finish_reason)},
+        {"seed", result.seed},
+        {"usage", {{"prompt_tokens", result.prompt_tokens}, {"completion_tokens", result.generated_tokens}}},
+        {"timings",
+         {{"prepare_s", result.prepare_s},
+          {"image_s", result.image_s},
+          {"prefill_s", result.prefill_s},
+          {"decode_s", result.decode_s}}},
+    };
+}
+
+static bool write_sse(httplib::DataSink& sink, const char* event, const json& data) {
+    // dump() escapes newlines, so the payload is always one SSE data line.
+    const std::string message = std::string("event: ") + event + "\ndata: " + data.dump() + "\n\n";
+    return sink.write(message.data(), message.size());
+}
+
 void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
     ServerRuntime* runtime = &rt;
 
     svr.Get("/sdcpp/v1/capabilities", [runtime](const httplib::Request&, httplib::Response& res) {
         res.status = 200;
         res.set_content(make_capabilities_json(*runtime).dump(), "application/json");
+    });
+
+    // Text generation with the text encoder's LLM (prompt enhancer). Synchronous like /upscale: it waits for
+    // the running job and holds the context while it generates. With "stream" (the default) the reply is
+    // Server-Sent Events: "delta" {text} per piece, then "done" {text, finish_reason, seed, usage, timings}
+    // or "error" {error}. Closing the connection stops the generation.
+    svr.Post("/sdcpp/v1/text_gen", [runtime](const httplib::Request& req, httplib::Response& res) {
+        try {
+            if (!sd_ctx_supports_text_generation(runtime->sd_ctx)) {
+                res.status = 400;
+                res.set_content(R"({"error":"the loaded model has no text encoder that supports text generation"})",
+                                "application/json");
+                return;
+            }
+            auto request = std::make_shared<TextGenRequest>();
+            std::string error_message;
+            if (req.body.empty() || !parse_text_gen_request(json::parse(req.body), *request, error_message)) {
+                res.status = 400;
+                res.set_content(json({{"error", req.body.empty() ? "empty body" : error_message}}).dump(),
+                                "application/json");
+                return;
+            }
+
+            if (!request->stream) {
+                std::lock_guard<std::mutex> ctx_lock(*runtime->sd_ctx_mutex);
+                sd_text_gen_result_t result = {};
+                char* text                  = generate_text(runtime->sd_ctx, &request->params, nullptr, nullptr, &result);
+                if (text == nullptr) {
+                    res.status = 500;
+                    res.set_content(R"({"error":"text generation failed"})", "application/json");
+                    return;
+                }
+                json out = make_text_gen_done_json(text, result);
+                free(text);
+                res.status = 200;
+                res.set_content(out.dump(), "application/json");
+                return;
+            }
+
+            res.status = 200;
+            res.set_header("Cache-Control", "no-cache");
+            res.set_chunked_content_provider(
+                "text/event-stream",
+                [runtime, request](size_t, httplib::DataSink& sink) {
+                    // Sent before waiting for a running job, so the client gets the headers at once.
+                    const std::string waiting = ": waiting for the model\n\n";
+                    if (!sink.write(waiting.data(), waiting.size())) {
+                        return false;
+                    }
+                    std::lock_guard<std::mutex> ctx_lock(*runtime->sd_ctx_mutex);
+                    auto on_piece = [](const char* piece, void* data) {
+                        return write_sse(*static_cast<httplib::DataSink*>(data), "delta", {{"text", piece}});
+                    };
+                    sd_text_gen_result_t result = {};
+                    char* text                  = generate_text(runtime->sd_ctx, &request->params, on_piece, &sink, &result);
+                    if (text == nullptr) {
+                        write_sse(sink, "error", {{"error", "text generation failed"}});
+                    } else {
+                        write_sse(sink, "done", make_text_gen_done_json(text, result));
+                        free(text);
+                    }
+                    sink.done();
+                    return true;
+                });
+        } catch (const json::exception& e) {
+            res.status = 400;
+            res.set_content(json({{"error", "invalid json"}, {"message", e.what()}}).dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(json({{"error", "server_error"}, {"message", e.what()}}).dump(), "application/json");
+        }
     });
 
     svr.Post("/sdcpp/v1/upscale", [runtime](const httplib::Request& req, httplib::Response& res) {
