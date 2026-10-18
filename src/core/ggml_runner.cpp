@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <exception>
 #include <map>
 #include <utility>
@@ -712,7 +713,9 @@ std::optional<sd::Tensor<float>> GGMLRunner::compute_reusable(uint64_t key, get_
         reuse.key             = key;
         reuse.graph           = last_graph_;
         // A graph id tells the backend the graph is unchanged between calls (CUDA graphs skip their checks).
-        reuse.graph->uid      = ggml_graph_next_uid();
+        // Our own ids, top bit set, never collide with ggml's (ggml_graph_next_uid() is not exported).
+        static std::atomic<uint64_t> next_reuse_uid{1ULL << 63};
+        reuse.graph->uid      = next_reuse_uid.fetch_add(1);
         reuse.output          = ggml_get_tensor(compute_ctx, final_result_name.c_str());
         reuse.workspace_epoch = workspace_.epoch();
         for (ggml_tensor* param : collect_used_param_tensors(last_graph_)) {
