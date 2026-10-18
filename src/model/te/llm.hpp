@@ -30,6 +30,7 @@
 #include "model/common/rope.hpp"
 #include "model_loader.h"
 #include "model_manager.h"
+#include "runtime/text_sampler.h"
 #include "tokenizers/bpe_tokenizer.h"
 #include "tokenizers/gemma_tokenizer.h"
 #include "tokenizers/mistral_tokenizer.h"
@@ -3049,17 +3050,19 @@ namespace LLM {
             sync_runtime_residency();
         }
 
-        // Greedy decoding. Every generated token, stop token included, is passed to on_token with its
-        // logits; on_token returns false to stop early. Releases the KV cache and the runner at the end.
-        bool generate_greedy(const int n_threads,
-                             const sd::Tensor<int32_t>& input_ids,
-                             const ImageEmbeds& image_embeds,
-                             const DeepStackImageEmbeds& deepstack_image_embeds,
-                             const std::vector<ImageGrid>& image_grids,
-                             int max_new_tokens,
-                             const std::set<int32_t>& stop_tokens,
-                             std::vector<int32_t>& tokens,
-                             const std::function<bool(int32_t, const sd::Tensor<float>&)>& on_token = nullptr) {
+        // Autoregressive decoding; sampler == nullptr is greedy. Every generated token, stop token included,
+        // is passed to on_token with its logits; on_token returns false to stop early. Releases the KV cache
+        // and the runner at the end.
+        bool generate(const int n_threads,
+                      const sd::Tensor<int32_t>& input_ids,
+                      const ImageEmbeds& image_embeds,
+                      const DeepStackImageEmbeds& deepstack_image_embeds,
+                      const std::vector<ImageGrid>& image_grids,
+                      int max_new_tokens,
+                      const std::set<int32_t>& stop_tokens,
+                      std::vector<int32_t>& tokens,
+                      sd::text::Sampler* sampler                                             = nullptr,
+                      const std::function<bool(int32_t, const sd::Tensor<float>&)>& on_token = nullptr) {
             tokens.clear();
             release_vision_buffers();
             bool ok = max_new_tokens > 0 && init_kv_cache(input_ids.numel() + max_new_tokens);
@@ -3071,7 +3074,9 @@ namespace LLM {
                         break;
                     }
                     const float* data = logits.data();
-                    const auto token  = static_cast<int32_t>(std::max_element(data, data + logits.numel()) - data);
+                    const auto token  = sampler != nullptr
+                                            ? sampler->sample(data, logits.numel())
+                                            : static_cast<int32_t>(std::max_element(data, data + logits.numel()) - data);
                     tokens.push_back(token);
                     if ((on_token && !on_token(token, logits)) || stop_tokens.count(token) ||
                         static_cast<int>(tokens.size()) >= max_new_tokens) {
@@ -3083,6 +3088,19 @@ namespace LLM {
             free_kv_cache();
             runner_end();
             return ok;
+        }
+
+        bool generate_greedy(const int n_threads,
+                             const sd::Tensor<int32_t>& input_ids,
+                             const ImageEmbeds& image_embeds,
+                             const DeepStackImageEmbeds& deepstack_image_embeds,
+                             const std::vector<ImageGrid>& image_grids,
+                             int max_new_tokens,
+                             const std::set<int32_t>& stop_tokens,
+                             std::vector<int32_t>& tokens,
+                             const std::function<bool(int32_t, const sd::Tensor<float>&)>& on_token = nullptr) {
+            return generate(n_threads, input_ids, image_embeds, deepstack_image_embeds, image_grids, max_new_tokens,
+                            stop_tokens, tokens, nullptr, on_token);
         }
 
         // LLaDA-Image's QueryFormer consumes the raw token embeddings before the backbone runs,
