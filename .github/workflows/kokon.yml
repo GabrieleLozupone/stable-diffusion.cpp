@@ -22,8 +22,8 @@ on:
         default: false
 
 env:
-  # The upstream commit the branch is rebased on: update it at every sync (the release notes list what is on top).
-  UPSTREAM_BASE: b13a482
+  # The upstream commit last merged into the branch: update it at every sync (the release notes list what is on top).
+  UPSTREAM_BASE: fd21ecf
   VULKAN_VERSION: 1.4.328.1
   ROCM_VERSION: "10.1.0"
   CUDA_ARCHS: "61;70;75;80;86;89;90;100;120"
