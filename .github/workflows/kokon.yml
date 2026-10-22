@@ -5,9 +5,11 @@
 # CUDA; macOS targets 15.0 (upstream's binaries need macOS 26); CUDA builds use CUDA graphs (GGML_CUDA_GRAPHS=ON,
 # with the ggml patch in GabrieleLozupone/ggml that captures only reused graphs).
 #
-# A push to kokon builds and smoke-tests everything (artifacts only). Publishing is manual: run the workflow with
-# create_release. The tag is kokon-<commit count>-<short sha>, like upstream's master-<n>-<sha>. Kokon pins engine
-# files by SHA-256 and rebuilds are not byte-identical, so a published engine is never replaced.
+# A push to kokon builds and smoke-tests everything and, when every job passes, publishes the run's engines as a
+# prerelease (manual runs publish only with create_release). The tag is kokon-<commit count>-<short sha>, like
+# upstream's master-<n>-<sha>. Publishing changes nothing for users: Kokon downloads only the tag pinned in its
+# catalog and engine.json. Kokon pins engine files by SHA-256 and rebuilds are not byte-identical, so a published
+# engine is never replaced.
 name: Kokon engines
 
 on:
@@ -518,7 +520,7 @@ jobs:
           grep -qi "metal" run.txt
 
   release:
-    if: github.event_name == 'workflow_dispatch' && inputs.create_release
+    if: github.event_name == 'push' || inputs.create_release
     needs: [meta, windows, windows-rocm, linux-smoke, linux-rocm, macos-smoke]
     runs-on: ubuntu-latest
     permissions:
