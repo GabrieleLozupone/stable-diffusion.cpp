@@ -928,6 +928,8 @@ namespace LLM {
         int64_t txt_token_start  = 0;
         int64_t txt_token_end    = 0;
         ggml_tensor* input_embed = nullptr;
+        // Image and DeepStack indices remain in the expanded sequence coordinates.
+        int64_t removed_tokens = 0;
 
         for (int i = 0; i < image_embeds.size(); i++) {
             if (i == 0) {
@@ -935,7 +937,10 @@ namespace LLM {
             } else {
                 txt_token_start = image_embeds[i - 1].first + image_embeds[i - 1].second->ne[1];
             }
-            txt_token_end = image_embeds[i].first;
+            txt_token_start -= removed_tokens;
+            txt_token_end = image_embeds[i].first - removed_tokens;
+            removed_tokens += image_embeds[i].second->ne[1] - 1;
+            GGML_ASSERT(txt_token_start >= 0 && txt_token_end >= txt_token_start && txt_token_end < raw_x->ne[1]);
 
             // An embed can sit flush against the previous one or at the very start/end of the
             // sequence, leaving no text tokens to splice around it.
@@ -955,14 +960,14 @@ namespace LLM {
             }
         }
 
-        txt_token_start = image_embeds[image_embeds.size() - 1].first + image_embeds[image_embeds.size() - 1].second->ne[1];
+        txt_token_start = image_embeds[image_embeds.size() - 1].first + image_embeds[image_embeds.size() - 1].second->ne[1] - removed_tokens;
         txt_token_end   = raw_x->ne[1];
 
         if (txt_token_end > txt_token_start) {
             auto final_txt_embed = ggml_ext_slice(ctx->ggml_ctx, raw_x, 1, txt_token_start, txt_token_end);
             input_embed          = ggml_concat(ctx->ggml_ctx, input_embed, final_txt_embed, 1);
         }
-        GGML_ASSERT(raw_x->ne[1] == input_embed->ne[1]);
+        GGML_ASSERT(raw_x->ne[1] + removed_tokens == input_embed->ne[1]);
         return input_embed;
     }
 
@@ -2707,6 +2712,9 @@ namespace LLM {
             }
 
             int64_t n_tokens = input_ids->ne[0];
+            for (const auto& image_embed : image_embeds) {
+                n_tokens += image_embed.second->ne[1] - 1;
+            }
             if (config.arch == LLMArch::MISTRAL_SMALL_3_2 ||
                 config.arch == LLMArch::MINISTRAL_3_3B ||
                 config.arch == LLMArch::QWEN3 ||
@@ -2975,16 +2983,26 @@ namespace LLM {
             return kv_cache_.n_past;
         }
 
-        // Appends input_ids (only the first call may contain images) to the KV cache and returns the
-        // next-token logits: [vocab_size, 1]. Needs init_lm_head() and init_kv_cache(). Weights stay
-        // on the compute backend between calls; call runner_end() when the generation is over.
+        // Sequence length once each image's single placeholder token is replaced by its embeddings.
+        static int64_t expanded_token_count(const sd::Tensor<int32_t>& input_ids, const ImageEmbeds& image_embeds) {
+            int64_t n_tokens = input_ids.numel();
+            for (const auto& image_embed : image_embeds) {
+                n_tokens += image_embed.second.shape()[1] - 1;
+            }
+            return n_tokens;
+        }
+
+        // Appends input_ids (only the first call may contain images, one placeholder token each) to the KV
+        // cache and returns the next-token logits: [vocab_size, 1]. Needs init_lm_head() and init_kv_cache().
+        // Weights stay on the compute backend between calls; call runner_end() when the generation is over.
         sd::Tensor<float> compute_logits_cached(const int n_threads,
                                                 const sd::Tensor<int32_t>& input_ids,
                                                 const ImageEmbeds& image_embeds                    = {},
                                                 const DeepStackImageEmbeds& deepstack_image_embeds = {},
                                                 const std::vector<ImageGrid>& image_grids          = {}) {
             GGML_ASSERT(model.has_lm_head());
-            if (!kv_cache_.active() || kv_cache_.n_past + input_ids.numel() > kv_cache_.capacity) {
+            const int64_t n_tokens = expanded_token_count(input_ids, image_embeds);
+            if (!kv_cache_.active() || kv_cache_.n_past + n_tokens > kv_cache_.capacity) {
                 LOG_ERROR("%s KV cache is full or not initialized", get_desc().c_str());
                 return {};
             }
@@ -3024,7 +3042,6 @@ namespace LLM {
                 logits = take_or_empty(GGMLRunner::compute(get_graph, n_threads, false));
             }
             if (!logits.empty()) {
-                const int64_t n_tokens = input_ids.numel();
                 kv_cache_.n_past += n_tokens;
                 // Section 0 of the last token; text positions only ever grow by one.
                 kv_cache_.next_pos = input_pos_vec[n_tokens - 1] + 1;
@@ -3065,7 +3082,7 @@ namespace LLM {
                       const std::function<bool(int32_t, const sd::Tensor<float>&)>& on_token = nullptr) {
             tokens.clear();
             release_vision_buffers();
-            bool ok = max_new_tokens > 0 && init_kv_cache(input_ids.numel() + max_new_tokens);
+            bool ok = max_new_tokens > 0 && init_kv_cache(expanded_token_count(input_ids, image_embeds) + max_new_tokens);
             if (ok) {
                 auto logits = compute_logits_cached(n_threads, input_ids, image_embeds, deepstack_image_embeds, image_grids);
                 while (true) {
@@ -3471,20 +3488,17 @@ namespace LLM {
                     LOG_VERBOSE("llm encode_image test done in %lldms", t1 - t0);
                 }
 
-                std::string placeholder  = "<|image_pad|>";
-                std::string img_prompt   = "Picture 1: <|vision_start|>";  // [24669, 220, 16, 25, 220, 151652]
-                int64_t num_image_tokens = image_embed.shape()[1];
-                img_prompt.reserve(num_image_tokens * placeholder.size());
-                for (int i = 0; i < num_image_tokens; i++) {
-                    img_prompt += placeholder;
-                }
-                img_prompt += "<|vision_end|>";
-
-                std::vector<std::pair<int, sd::Tensor<float>>> image_embeds;
-                image_embeds.emplace_back(64, image_embed);
+                const std::string image_prefix = "Picture 1: <|vision_start|>";
+                const std::string img_prompt   = image_prefix + "<|image_pad|><|vision_end|>";
 
                 std::pair<int, int> prompt_attn_range;
                 std::string text = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n";
+                std::vector<int> prefix_tokens;
+                if (!tokenizer->encode(text + image_prefix, prefix_tokens, nullptr)) {
+                    return;
+                }
+                std::vector<std::pair<int, sd::Tensor<float>>> image_embeds;
+                image_embeds.emplace_back(static_cast<int>(prefix_tokens.size()), image_embed);
                 text += img_prompt;
                 prompt_attn_range.first = static_cast<int>(text.size());
                 text += "change 'flux.cpp' to 'edit.cpp'";

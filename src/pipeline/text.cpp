@@ -118,7 +118,9 @@ namespace sd::pipeline {
             stop_tokens.insert(id[0]);
         }
 
-        // Chat template; image token counts are known from the sizes before running the vision tower.
+        // Chat template with one <|image_pad|> per image, which the LLM replaces with all of the image's
+        // embeddings; indices count the expanded sequence. Image token counts are known from the sizes
+        // before running the vision tower.
         const int patch  = llm.config.vision.patch_size;
         const int factor = patch * llm.config.vision.spatial_merge_size;
         std::string prompt;
@@ -128,6 +130,7 @@ namespace sd::pipeline {
         prompt += "<|im_start|>user\n";
         std::vector<std::pair<int, int>> sizes;
         std::vector<int> embed_index;
+        int image_extra_tokens = 0;
         for (int i = 0; i < params->images_count; ++i) {
             const sd_image_t& image = params->images[i];
             if (image.data == nullptr || image.width == 0 || image.height == 0 || image.channel == 0 || image.channel > 4) {
@@ -144,13 +147,10 @@ namespace sd::pipeline {
             if (!tokenizer.encode(prompt, prefix)) {
                 return nullptr;
             }
-            embed_index.push_back(static_cast<int>(prefix.size()));
+            embed_index.push_back(static_cast<int>(prefix.size()) + image_extra_tokens);
             sizes.emplace_back(w, h);
-            const int count = (w / factor) * (h / factor);
-            for (int j = 0; j < count; ++j) {
-                prompt += "<|image_pad|>";
-            }
-            prompt += "<|vision_end|>";
+            image_extra_tokens += (w / factor) * (h / factor) - 1;
+            prompt += "<|image_pad|><|vision_end|>";
         }
         prompt += std::string(params->prompt) + "<|im_end|>\n<|im_start|>assistant\n";
         std::vector<int> ids;
@@ -158,13 +158,14 @@ namespace sd::pipeline {
             LOG_ERROR("failed to tokenize the prompt");
             return nullptr;
         }
-        const int64_t n_ctx = static_cast<int64_t>(ids.size()) + params->max_tokens;
+        const int64_t prompt_tokens = static_cast<int64_t>(ids.size()) + image_extra_tokens;
+        const int64_t n_ctx         = prompt_tokens + params->max_tokens;
         if (n_ctx > TEXT_GEN_MAX_CONTEXT) {
-            LOG_ERROR("prompt (%zu tokens) + max_tokens (%d) exceeds the %" PRId64 "-token text generation limit",
-                      ids.size(), params->max_tokens, TEXT_GEN_MAX_CONTEXT);
+            LOG_ERROR("prompt (%" PRId64 " tokens) + max_tokens (%d) exceeds the %" PRId64 "-token text generation limit",
+                      prompt_tokens, params->max_tokens, TEXT_GEN_MAX_CONTEXT);
             return nullptr;
         }
-        res.prompt_tokens = static_cast<int>(ids.size());
+        res.prompt_tokens = static_cast<int>(prompt_tokens);
 
         LLM::LLMRunner* runner = sd->prepare_text_generation(n_ctx);
         if (runner == nullptr) {

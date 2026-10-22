@@ -9,6 +9,7 @@
 #include "common/common.h"
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
+#include "model_catalog.h"
 
 namespace fs = std::filesystem;
 
@@ -100,12 +101,13 @@ static fs::path resolve_display_model_path(const ServerRuntime& runtime) {
     return {};
 }
 
-static json make_sample_params_json(const sd_sample_params_t& sample_params, const std::vector<int>& skip_layers) {
+static json make_sample_params_json(const sd_sample_params_t& sample_params, const std::vector<int>& skip_layers, const std::vector<float>& custom_sigmas = {}) {
     const auto& guidance = sample_params.guidance;
     return {
         {"scheduler", capability_scheduler_name(sample_params.scheduler)},
         {"sample_method", capability_sample_method_name(sample_params.sample_method)},
         {"sample_steps", sample_params.sample_steps},
+        {"custom_sigmas", custom_sigmas},
         {"eta", finite_number_or_null(sample_params.eta)},
         {"shifted_timestep", sample_params.shifted_timestep},
         {"flow_shift", finite_number_or_null(sample_params.flow_shift)},
@@ -155,7 +157,7 @@ static json make_img_gen_defaults_json(const SDGenerationParams& defaults, const
         {"increase_ref_index", defaults.increase_ref_index},
         {"control_strength", defaults.control_strength},
         {"ip_adapter_strength", defaults.ip_adapter_strength},
-        {"sample_params", make_sample_params_json(defaults.sample_params, defaults.skip_layers)},
+        {"sample_params", make_sample_params_json(defaults.sample_params, defaults.skip_layers, defaults.custom_sigmas)},
         {"hires", make_hires_json(defaults)},
         {"vae_tiling_params", make_vae_tiling_json(defaults.vae_tiling_params)},
         {"cache_mode", defaults.cache_mode},
@@ -181,7 +183,7 @@ static json make_vid_gen_defaults_json(const SDGenerationParams& defaults, const
         {"fps", defaults.fps},
         {"moe_boundary", defaults.moe_boundary},
         {"vace_strength", defaults.vace_strength},
-        {"sample_params", make_sample_params_json(defaults.sample_params, defaults.skip_layers)},
+        {"sample_params", make_sample_params_json(defaults.sample_params, defaults.skip_layers, defaults.custom_sigmas)},
         {"high_noise_sample_params", make_sample_params_json(defaults.high_noise_sample_params, defaults.high_noise_skip_layers)},
         {"hires", make_hires_json(defaults)},
         {"vae_tiling_params", make_vae_tiling_json(defaults.vae_tiling_params)},
@@ -206,7 +208,7 @@ static json make_img_gen_features_json() {
         {"hires", true},
         {"cache", true},
         {"cancel_queued", true},
-        {"cancel_generating", false},
+        {"cancel_generating", true},
         {"preview", true},
     };
 }
@@ -221,7 +223,7 @@ static json make_vid_gen_features_json() {
         {"vae_tiling", true},
         {"cache", true},
         {"cancel_queued", true},
-        {"cancel_generating", false},
+        {"cancel_generating", true},
         {"preview", true},
     };
 }
@@ -268,6 +270,7 @@ static json make_capabilities_json(ServerRuntime& runtime) {
             available_loras.push_back({
                 {"name", entry.name},
                 {"path", entry.path},
+                {"display_path", entry.display_path},
             });
         }
     }
@@ -346,25 +349,41 @@ static json make_capabilities_json(ServerRuntime& runtime) {
         default_vid_output_format = video_output_formats[0].get<std::string>();
     }
 
+    const json generation_features = model_generation_features(runtime);
+    auto recipe_features           = [&](json features, bool video) {
+        features["init_image"] = generation_features.at(video ? "init_image" : "img2img");
+        for (const char* key : {"mask_image", "ref_images", "end_image", "control_frames", "lora", "vae_tiling", "cache", "preview"}) {
+            if (features.contains(key) || std::string(key) == "ref_images")
+                features[key] = generation_features.at(key);
+        }
+        if (video)
+            features["high_noise_sample_params"] = generation_features.at("high_noise");
+        else {
+            features["mask_image"]       = generation_features.at("mask_image").get<bool>() && generation_features.at("img2img").get<bool>();
+            features["control_image"]    = generation_features.at("controlnet").get<bool>() || generation_features.at("control_image").get<bool>();
+            features["ip_adapter_image"] = generation_features.at("ip_adapter");
+        }
+        return features;
+    };
     json defaults_by_mode       = json::object();
     json output_formats_by_mode = json::object();
     json features_by_mode       = json::object();
     if (supports_img) {
         defaults_by_mode["img_gen"]       = make_img_gen_defaults_json(defaults, default_img_output_format);
         output_formats_by_mode["img_gen"] = image_output_formats;
-        features_by_mode["img_gen"]       = make_img_gen_features_json();
+        features_by_mode["img_gen"]       = recipe_features(make_img_gen_features_json(), false);
     }
     if (supports_vid) {
         defaults_by_mode["vid_gen"]       = make_vid_gen_defaults_json(defaults, default_vid_output_format);
         output_formats_by_mode["vid_gen"] = video_output_formats;
-        features_by_mode["vid_gen"]       = make_vid_gen_features_json();
+        features_by_mode["vid_gen"]       = recipe_features(make_vid_gen_features_json(), true);
     }
 
     json top_level_defaults       = json::object();
     json top_level_output_formats = json::array();
     json top_level_features       = {
               {"cancel_queued", true},
-              {"cancel_generating", false},
+              {"cancel_generating", true},
     };
     std::string current_mode = "";
     if (supports_img) {
@@ -385,21 +404,23 @@ static json make_capabilities_json(ServerRuntime& runtime) {
         {"stem", model_path.stem().u8string()},
         {"path", model_path.u8string()},
     };
-    result["current_mode"]     = current_mode;
-    result["supported_modes"]  = supported_modes;
-    result["defaults"]         = top_level_defaults;
-    result["defaults_by_mode"] = defaults_by_mode;
-    result["limits"]           = {
-                  {"min_width", 64},
-                  {"max_width", 4096},
-                  {"min_height", 64},
-                  {"max_height", 4096},
-                  {"max_batch_count", 8},
-                  {"max_queue_size", manager.max_pending_jobs},
-                  {"max_upscale_width", k_max_upscale_dimension},
-                  {"max_upscale_height", k_max_upscale_dimension},
-                  {"max_text_tokens", k_max_text_tokens},
-                  {"max_text_images", k_max_text_images},
+    result["generation_features"] = generation_features;
+    result["runtime"]             = model_status(runtime);
+    result["current_mode"]        = current_mode;
+    result["supported_modes"]     = supported_modes;
+    result["defaults"]            = top_level_defaults;
+    result["defaults_by_mode"]    = defaults_by_mode;
+    result["limits"]              = {
+                     {"min_width", 64},
+                     {"max_width", k_max_generation_dimension},
+                     {"min_height", 64},
+                     {"max_height", k_max_generation_dimension},
+                     {"max_batch_count", 8},
+                     {"max_queue_size", manager.max_pending_jobs},
+                     {"max_upscale_width", k_max_upscale_dimension},
+                     {"max_upscale_height", k_max_upscale_dimension},
+                     {"max_text_tokens", k_max_text_tokens},
+                     {"max_text_images", k_max_text_images},
     };
     result["samplers"]               = samplers;
     result["schedulers"]             = schedulers;
@@ -441,7 +462,7 @@ static bool parse_img_gen_request(const json& body,
         error_message = "invalid generation parameters";
         return false;
     }
-    return true;
+    return validate_server_img_gen_request(runtime, request, error_message);
 }
 
 static bool parse_vid_gen_request(const json& body,
@@ -590,8 +611,9 @@ static bool write_sse(httplib::DataSink& sink, const char* event, const json& da
 
 void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
     ServerRuntime* runtime = &rt;
+    RuntimeRoutes routes(svr, rt);
 
-    svr.Get("/sdcpp/v1/capabilities", [runtime](const httplib::Request&, httplib::Response& res) {
+    routes.get("/sdcpp/v1/capabilities", [runtime](const httplib::Request&, httplib::Response& res) {
         res.status = 200;
         res.set_content(make_capabilities_json(*runtime).dump(), "application/json");
     });
@@ -600,7 +622,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
     // the running job and holds the context while it generates. With "stream" (the default) the reply is
     // Server-Sent Events: "delta" {text} per piece, then "done" {text, finish_reason, seed, usage, timings}
     // or "error" {error}. Closing the connection stops the generation.
-    svr.Post("/sdcpp/v1/text_gen", [runtime](const httplib::Request& req, httplib::Response& res) {
+    routes.post("/sdcpp/v1/text_gen", [runtime](const httplib::Request& req, httplib::Response& res) {
         try {
             if (!sd_ctx_supports_text_generation(runtime->sd_ctx)) {
                 res.status = 400;
@@ -643,6 +665,14 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     if (!sink.write(waiting.data(), waiting.size())) {
                         return false;
                     }
+                    // The route's model lock ends when the handler returns; hold it while generating so the
+                    // context cannot be unloaded under us (a model switch gets 409 "model_busy").
+                    std::shared_lock<std::shared_mutex> model_lock(runtime->models->runtime_mutex);
+                    if (!sd_ctx_supports_text_generation(runtime->sd_ctx)) {
+                        write_sse(sink, "error", {{"error", "the loaded model has no text encoder that supports text generation"}});
+                        sink.done();
+                        return true;
+                    }
                     std::lock_guard<std::mutex> ctx_lock(*runtime->sd_ctx_mutex);
                     auto on_piece = [](const char* piece, void* data) {
                         return write_sse(*static_cast<httplib::DataSink*>(data), "delta", {{"text", piece}});
@@ -667,7 +697,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
     });
 
-    svr.Post("/sdcpp/v1/upscale", [runtime](const httplib::Request& req, httplib::Response& res) {
+    routes.post("/sdcpp/v1/upscale", [runtime](const httplib::Request& req, httplib::Response& res) {
         try {
             if (req.body.empty()) {
                 res.status = 400;
@@ -832,7 +862,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
     });
 
-    svr.Post("/sdcpp/v1/img_gen", [runtime](const httplib::Request& req, httplib::Response& res) {
+    routes.post("/sdcpp/v1/img_gen", [runtime](const httplib::Request& req, httplib::Response& res) {
         try {
             if (req.body.empty()) {
                 res.status = 400;
@@ -858,7 +888,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             std::shared_ptr<AsyncGenerationJob> job = std::make_shared<AsyncGenerationJob>();
             job->kind                               = AsyncJobKind::ImgGen;
             job->status                             = AsyncJobStatus::Queued;
-            job->created_at                         = unix_timestamp_now();
+            job->created_at                         = unix_timestamp_now_ms();
             job->img_gen                            = std::move(request);
 
             {
@@ -894,7 +924,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
     });
 
-    svr.Post("/sdcpp/v1/vid_gen", [runtime](const httplib::Request& req, httplib::Response& res) {
+    routes.post("/sdcpp/v1/vid_gen", [runtime](const httplib::Request& req, httplib::Response& res) {
         try {
             if (req.body.empty()) {
                 res.status = 400;
@@ -920,7 +950,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             std::shared_ptr<AsyncGenerationJob> job = std::make_shared<AsyncGenerationJob>();
             job->kind                               = AsyncJobKind::VidGen;
             job->status                             = AsyncJobStatus::Queued;
-            job->created_at                         = unix_timestamp_now();
+            job->created_at                         = unix_timestamp_now_ms();
             job->vid_gen                            = std::move(request);
 
             {
@@ -956,7 +986,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
     });
 
-    svr.Get(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+))", [runtime](const httplib::Request& req, httplib::Response& res) {
+    routes.get(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+))", [runtime](const httplib::Request& req, httplib::Response& res) {
         AsyncJobManager& manager = *runtime->async_job_manager;
         std::lock_guard<std::mutex> lock(manager.mutex);
         purge_expired_jobs(manager);
@@ -978,7 +1008,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         res.set_content(make_async_job_json(manager, *it->second).dump(), "application/json");
     });
 
-    svr.Post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)", [runtime](const httplib::Request& req, httplib::Response& res) {
+    routes.post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)", [runtime](const httplib::Request& req, httplib::Response& res) {
         AsyncJobManager& manager = *runtime->async_job_manager;
         std::lock_guard<std::mutex> lock(manager.mutex);
         purge_expired_jobs(manager);
@@ -1009,8 +1039,9 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
 
         if (job.status == AsyncJobStatus::Generating) {
-            res.status = 409;
-            res.set_content(R"({"error":"job is currently generating and cannot be interrupted yet"})", "application/json");
+            job.cancel_requested.store(true);
+            res.status = 200;
+            res.set_content(make_async_job_json(manager, job).dump(), "application/json");
             return;
         }
 
